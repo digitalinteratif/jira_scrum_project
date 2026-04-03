@@ -1,529 +1,135 @@
 #!/usr/bin/env python3
 """
-Surgical Blueprint: Custom Domain Integration for URL Redirection (Flask + SQLAlchemy)
+High-Performance URL Shortening Web Service - Surgical Flask Blueprint
 
-Purpose:
-- Implements a small, self-contained Flask Blueprint (shortly_bp) that provides:
-  - UI using render_template_string (index, register, login, dashboard, password reset, shortener)
-  - Short URL generation that uses a configurable BASE_URL (from environment/.env)
-  - Root-domain slug listener: requests to /<7-8 char slug> redirect to destination
-  - HTTPS upgrade when BASE_URL is configured with https:// (checks X-Forwarded-Proto)
-  - Server-side sessions, secure password hashing, redirect cache and analytics enqueue
-
-Notes:
-- Uses only Python + Flask + SQLAlchemy + SQLite
-- No Node.js or backend JavaScript is used
-- Blueprint UI is server-rendered via render_template_string
-- To configure production domain, set environment variable BASE_URL (e.g., https://digitalinteractif.com)
-- Optional: install python-dotenv to load .env files (load_dotenv is used if available)
+Single-file Flask application using SQLAlchemy + SQLite. Provides:
+- Secure user login & registration (password hashing)
+- Dashboard UI (rendered via render_template_string) to create/manage short links
+- API (token-based via X-API-Key) for programmatic shortening and stats
+- Blazing-fast redirect engine with in-memory caching + lightweight rate limiting
+- Basic analytics tracking (clicks with timestamp, IP, UA, referrer)
+- Basic CSRF protection for forms
+- Security-conscious defaults (input validation, prepared updates, session protections)
 
 Usage:
-    from flask import Flask
-    from shortly_custom_domain import shortly_bp, init_shortly_app
+    python app.py
 
-    app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'replace-with-secure-random'
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shortly_demo_custom_domain.db'
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-    init_shortly_app(app)      # initializes DB, config (BASE_URL from env), email templates etc.
-    app.register_blueprint(shortly_bp)
-
-    app.run(debug=True)
+Notes:
+- This file intentionally uses only Python, Flask, and SQLAlchemy (SQLite) per requirements.
+- No JavaScript or Node is used.
 """
 
 import os
-import re
-import uuid
 import time
 import secrets
-import hashlib
-import threading
+import string
+from collections import deque, defaultdict
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urljoin
+from functools import wraps
+from urllib.parse import urlparse
 
 from flask import (
-    Blueprint,
-    Flask,
-    current_app,
-    request,
-    redirect,
-    render_template_string,
-    make_response,
+    Flask, request, redirect, url_for, session, abort, jsonify,
+    make_response, flash, get_flashed_messages, render_template_string
 )
-from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Optional dotenv loading (graceful if not installed)
-try:
-    from dotenv import load_dotenv
+# SQLAlchemy imports
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime, ForeignKey, Text, Boolean
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import declarative_base, relationship, scoped_session, sessionmaker
 
-    load_dotenv()
-except Exception:
-    # ignore if python-dotenv not present; environment variables can still be used
-    pass
+# -----------------------
+# Configuration
+# -----------------------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, "shortener.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-# SQLAlchemy instance (initialized in init_shortly_app)
-db = SQLAlchemy()
+APP_SECRET_KEY = os.environ.get("SHORTENER_SECRET") or secrets.token_urlsafe(32)
+DEFAULT_DOMAIN = os.environ.get("SHORTENER_DOMAIN") or "http://localhost:5000"
+SHORT_CODE_LENGTH = 6  # default length for generated short codes
+CACHE_TTL_SECONDS = 60  # TTL for in-memory redirect cache
+REDIRECT_RATE_LIMIT_PER_MIN = int(os.environ.get("REDIRECT_RPM", "1000"))  # per IP
+API_RATE_LIMIT_PER_MIN = int(os.environ.get("API_RPM", "60"))
 
-# Blueprint
-shortly_bp = Blueprint("shortly", __name__)
+# -----------------------
+# App & DB setup
+# -----------------------
+app = Flask(__name__)
+app.secret_key = APP_SECRET_KEY
+# Security-relevant session settings
+app.config.update({
+    "SESSION_COOKIE_HTTPONLY": True,
+    "SESSION_COOKIE_SAMESITE": "Lax",
+})
 
-# Internal pointer to the app (set in init_shortly_app)
-_APP = None
+# SQLAlchemy engine & session
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, pool_pre_ping=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+Base = declarative_base()
 
-# --------------------
-# Templates (strings) - UI served via render_template_string
-# --------------------
-LAYOUT = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>{{ title or "Shortly" }}</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin:0; padding:0; background:#f7f7f9; color:#222; }
-    header { background:#004a99; color:white; padding:12px 24px; }
-    header .brand { font-weight:700; font-size:20px; }
-    nav a { color: #bfe0ff; margin-right:10px; text-decoration:none; }
-    main { max-width:900px; margin:28px auto; background:white; padding:24px; border-radius:6px; box-shadow:0 2px 8px rgba(0,0,0,0.06); }
-    .form-row { margin-bottom:12px; }
-    label { display:block; font-size:14px; margin-bottom:6px; }
-    input[type=text], input[type=password], input[type=email] { width:100%; padding:8px; border:1px solid #d0d7de; border-radius:4px; }
-    button { background:#0066cc; color:white; border:none; padding:10px 14px; border-radius:4px; cursor:pointer; }
-    .muted { color:#666; font-size:13px; }
-    .danger { color:#b00020; }
-    .success { color: #016D11; }
-    table { width:100%; border-collapse:collapse; margin-top:12px; }
-    th, td { padding:8px; border-bottom:1px solid #eee; text-align:left; font-size:14px; }
-    .short-url { font-weight:600; font-family:monospace; }
-    footer { padding:12px 24px; text-align:center; color:#777; font-size:13px; margin-top:12px; }
-    .flash { padding:10px 12px; border-radius:6px; margin-bottom:12px; }
-  </style>
-</head>
-<body>
-<header>
-  <div style="display:flex;align-items:center;justify-content:space-between;max-width:1000px;margin:0 auto;">
-    <div class="brand"><a href="/" style="color:inherit;text-decoration:none;">Shortly</a></div>
-    <nav>
-      {% if current_user %}
-        <span class="muted">Signed in as {{ current_user.username }}</span>
-        <a href="/dashboard">Dashboard</a>
-        <a href="/logout">Logout</a>
-      {% else %}
-        <a href="/register">Register</a>
-        <a href="/login">Login</a>
-      {% endif %}
-    </nav>
-  </div>
-</header>
-<main>
-  {{ content|safe }}
-</main>
-<footer>
-  Built with security & speed in mind — UI-first. © {{ year }}
-</footer>
-</body>
-</html>
-"""
 
-INDEX_HTML = """
-<h1>Shortly — Fast, secure URL shortener</h1>
-<p class="muted">Shorten links, track clicks, and manage them from your dashboard.</p>
-
-<section>
-  <h3>Get started</h3>
-  {% if not current_user %}
-    <p><a href="/register"><button>Register</button></a> or <a href="/login"><button>Login</button></a></p>
-  {% else %}
-    <p><a href="/dashboard"><button>Go to Dashboard</button></a></p>
-  {% endif %}
-</section>
-
-<section style="margin-top:18px;">
-  <h3>Shorten a public link (no account required)</h3>
-  <form method="post" action="/shorten-public" id="shorten-public">
-    <div class="form-row">
-      <label for="url">URL</label>
-      <input type="text" id="url" name="url" placeholder="https://example.com/very/long" required>
-    </div>
-    <div class="form-row">
-      <label for="custom">Custom alias (optional)</label>
-      <input type="text" id="custom" name="custom" placeholder="my-alias (alphanumeric, - , _ )">
-    </div>
-    <button type="submit">Shorten</button>
-  </form>
-  <p class="muted">Shortened links created when not signed-in are anonymous and not manageable from a dashboard.</p>
-</section>
-"""
-
-LOGIN_HTML = """
-<h1>Login</h1>
-<form method="post" action="/login">
-  <div class="form-row">
-    <label for="username">Username or Email</label>
-    <input type="text" id="username" name="username" placeholder="username or email" required>
-  </div>
-  <div class="form-row">
-    <label for="password">Password</label>
-    <input type="password" id="password" name="password" placeholder="password" required>
-  </div>
-  <div class="form-row">
-    <label><input type="checkbox" name="remember"> Remember this device</label>
-  </div>
-  <button type="submit">Login</button>
-</form>
-<p class="muted">Forgot your password? <a href="/password-reset-request">Reset it</a></p>
-<p class="muted">Don't have an account? <a href="/register">Register</a></p>
-"""
-
-REGISTER_HTML = """
-<h1>Register</h1>
-<form method="post" action="/register">
-  <div class="form-row">
-    <label for="username">Username</label>
-    <input type="text" id="username" name="username" placeholder="username" pattern="[A-Za-z0-9_\\-]{3,30}" required>
-  </div>
-  <div class="form-row">
-    <label for="email">Email</label>
-    <input type="email" id="email" name="email" placeholder="you@example.com" required>
-  </div>
-  <div class="form-row">
-    <label for="password">Password</label>
-    <input type="password" id="password" name="password" placeholder="Choose a strong password" required>
-  </div>
-  <div class="form-row">
-    <label for="password2">Confirm Password</label>
-    <input type="password" id="password2" name="password2" placeholder="Confirm password" required>
-  </div>
-  <button type="submit">Create account</button>
-</form>
-<p class="muted">We will send a verification email to activate your account.</p>
-"""
-
-DASHBOARD_HTML = """
-<h1>Your Dashboard</h1>
-
-<section>
-  <h3>Create a short link</h3>
-  <form method="post" action="/dashboard/shorten">
-    <div class="form-row">
-      <label for="url">Destination URL</label>
-      <input type="text" id="url" name="url" placeholder="https://example.com/..." required>
-    </div>
-    <div class="form-row">
-      <label for="custom">Custom alias (optional)</label>
-      <input type="text" id="custom" name="custom" placeholder="alias">
-    </div>
-    <div class="form-row">
-      <label for="private">Private (only you can view analytics)</label>
-      <input type="checkbox" id="private" name="private">
-    </div>
-    <button type="submit">Shorten</button>
-  </form>
-</section>
-
-<section style="margin-top:16px;">
-  <h3>Your links</h3>
-  {% if urls %}
-    <table>
-      <thead><tr><th>Short</th><th>Destination</th><th>Clicks</th><th>Created</th><th>Actions</th></tr></thead>
-      <tbody>
-      {% for u in urls %}
-        <tr>
-          <td class="short-url"><a href="{{ base_url }}/{{ u.code }}">{{ base_url }}/{{ u.code }}</a></td>
-          <td><a href="{{ u.destination }}" target="_blank" rel="noopener">{{ u.destination }}</a></td>
-          <td>{{ u.clicks_count }}</td>
-          <td>{{ u.created_at }}</td>
-          <td><a href="/dashboard/url/{{ u.id }}">Manage</a></td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  {% else %}
-    <p class="muted">You haven't created any short links yet.</p>
-  {% endif %}
-</section>
-"""
-
-PASSWORD_RESET_REQUEST_HTML = """
-<h1>Password Reset</h1>
-<p class="muted">Enter the email address associated with your account; we'll send a reset link.</p>
-<form method="post" action="/password-reset-request">
-  <div class="form-row">
-    <label for="email">Email</label>
-    <input type="email" id="email" name="email" placeholder="you@example.com" required>
-  </div>
-  <button type="submit">Send reset link</button>
-</form>
-"""
-
-PASSWORD_RESET_HTML = """
-<h1>Choose a new password</h1>
-<form method="post" action="/password-reset/{{ token }}">
-  <div class="form-row">
-    <label for="password">New password</label>
-    <input type="password" id="password" name="password" required>
-  </div>
-  <div class="form-row">
-    <label for="password2">Confirm new password</label>
-    <input type="password" id="password2" name="password2" required>
-  </div>
-  <div class="form-row">
-    <label for="code">Reset code</label>
-    <input type="text" id="code" name="code" placeholder="Enter the numeric/alphanumeric code from your email" required>
-  </div>
-  <button type="submit">Reset password</button>
-</form>
-"""
-
-# --------------------
+# -----------------------
 # Models
-# --------------------
-class User(db.Model):
+# -----------------------
+class User(Base):
     __tablename__ = "users"
-    id = db.Column(db.Integer, primary_key=True)
-    uuid = db.Column(db.String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(200), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    is_active = db.Column(db.Boolean, default=True, nullable=False)
-    email_verified_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)
+    api_key = Column(String(64), unique=True, nullable=False, index=True)
+    is_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    short_urls = relationship("ShortURL", back_populates="owner")
+
+    def verify_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
 
 
-class URL(db.Model):
-    __tablename__ = "urls"
-    id = db.Column(db.Integer, primary_key=True)
-    owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
-    code = db.Column(db.String(128), unique=True, nullable=False, index=True)
-    destination = db.Column(db.Text, nullable=False)
-    is_private = db.Column(db.Boolean, default=False, nullable=False)
-    clicks_count = db.Column(db.Integer, default=0, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+class ShortURL(Base):
+    __tablename__ = "shorturls"
+    id = Column(Integer, primary_key=True)
+    code = Column(String(128), unique=True, nullable=False, index=True)
+    target_url = Column(Text, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    visits = Column(Integer, default=0, nullable=False)
+
+    owner = relationship("User", back_populates="short_urls")
+    clicks = relationship("Click", back_populates="shorturl", cascade="all, delete-orphan")
 
 
-class Click(db.Model):
+class Click(Base):
     __tablename__ = "clicks"
-    id = db.Column(db.Integer, primary_key=True)
-    url_id = db.Column(db.Integer, db.ForeignKey("urls.id"), nullable=False, index=True)
-    occurred_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    ip = db.Column(db.String(45))
-    user_agent = db.Column(db.String(1024))
-    referer = db.Column(db.String(1024))
-    country = db.Column(db.String(100))
-    region = db.Column(db.String(100))
+    id = Column(Integer, primary_key=True)
+    short_id = Column(Integer, ForeignKey("shorturls.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    ip = Column(String(45))
+    user_agent = Column(Text)
+    referrer = Column(Text)
+
+    shorturl = relationship("ShortURL", back_populates="clicks")
 
 
-class EmailTemplate(db.Model):
-    __tablename__ = "email_templates"
-    name = db.Column(db.String(80), primary_key=True)
-    subject_template = db.Column(db.Text, nullable=False)
-    body_template = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+# Create DB tables
+Base.metadata.create_all(bind=engine)
 
 
-class PasswordReset(db.Model):
-    __tablename__ = "password_resets"
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    token = db.Column(db.String(128), unique=True, nullable=False, index=True)
-    code_hash = db.Column(db.String(128), nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
-    used = db.Column(db.Boolean, default=False, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    ip_request = db.Column(db.String(45))
+# -----------------------
+# Utility helpers
+# -----------------------
+def db_session():
+    """Provides a SQLAlchemy session (scoped). Remember to close after usage if you take it manually."""
+    return SessionLocal()
 
 
-class EmailVerification(db.Model):
-    __tablename__ = "email_verifications"
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    token = db.Column(db.String(128), unique=True, nullable=False, index=True)
-    code_hash = db.Column(db.String(128), nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
-    used = db.Column(db.Boolean, default=False, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    ip_request = db.Column(db.String(45))
-
-
-class SessionModel(db.Model):
-    __tablename__ = "sessions"
-    session_id = db.Column(db.String(128), primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
-    data = db.Column(db.Text)
-
-
-# --------------------
-# Helpers: rendering
-# --------------------
-def render_with_layout(content_template, **context):
+def is_valid_url(url: str) -> bool:
     try:
-        content_html = render_template_string(content_template, **context)
-    except Exception as e:
-        content_html = f"<h1>Rendering error</h1><p class='muted'>Template rendering failed: {e}</p>"
-    base_context = dict(year=datetime.utcnow().year)
-    base_context.update(context)
-    base_context.update({"content": content_html})
-    try:
-        return render_template_string(LAYOUT, **base_context)
-    except Exception:
-        return f"<html><body>{content_html}</body></html>"
-
-
-def render_with_message_and_template(template_str, message=None, kind="danger", **context):
-    try:
-        content_html = render_template_string(template_str, **context)
-    except Exception as e:
-        content_html = f"<h1>Rendering error</h1><p class='muted'>Template rendering failed: {e}</p>"
-    if message:
-        msg_html = f"<div class='flash {kind}'><strong>{message}</strong></div>"
-        content_html = msg_html + content_html
-    base_context = dict(year=datetime.utcnow().year)
-    base_context.update(context)
-    base_context.update({"content": content_html})
-    try:
-        return render_template_string(LAYOUT, **base_context)
-    except Exception:
-        return f"<html><body>{content_html}</body></html>"
-
-
-# --------------------
-# Utilities & constants
-# --------------------
-SESSION_COOKIE_NAME = "session_id"
-ALIAS_RE = re.compile(r"^[A-Za-z0-9_\-]{2,64}$")
-_CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-ROOT_SLUG_RE = re.compile(r"^[A-Za-z0-9]{7,8}$")  # AC2: 7-8 character slugs (letters/digits)
-
-def now_utc():
-    return datetime.utcnow()
-
-
-# --------------------
-# Redirect cache (tiny in-memory TTL cache)
-# --------------------
-_redirect_cache = {}
-_cache_lock = threading.Lock()
-
-def cache_set_code(code: str, obj: dict, ttl: int = 60):
-    with _cache_lock:
-        _redirect_cache[code] = {"obj": obj, "expires": time.time() + ttl}
-
-def cache_get_code(code: str):
-    with _cache_lock:
-        entry = _redirect_cache.get(code)
-        if not entry:
-            return None
-        if entry["expires"] < time.time():
-            del _redirect_cache[code]
-            return None
-        return entry["obj"]
-
-
-# --------------------
-# DB-centric helpers (SQLAlchemy)
-# --------------------
-def find_user_by_username_or_email(identifier: str):
-    if not identifier:
-        return None
-    return User.query.filter(
-        (User.username.ilike(identifier)) | (User.email.ilike(identifier))
-    ).first()
-
-def find_user_by_email(email: str):
-    if not email:
-        return None
-    return User.query.filter(User.email.ilike(email)).first()
-
-def load_user_by_id(user_id: int):
-    if not user_id:
-        return None
-    return User.query.get(user_id)
-
-def create_user_record(username: str, email: str, password_hash: str):
-    u = User(username=username, email=email, password_hash=password_hash)
-    db.session.add(u)
-    db.session.commit()
-    return u
-
-def create_email_verification(user_id: int, code_hash: str, token: str, expires_at: datetime, ip_request: str = None):
-    ev = EmailVerification(user_id=user_id, code_hash=code_hash, token=token, expires_at=expires_at, ip_request=ip_request)
-    db.session.add(ev)
-    db.session.commit()
-
-def create_password_reset_entry(user_id: int, token: str, code_hash: str, expires_at: datetime, ip_request: str = None):
-    pr = PasswordReset(user_id=user_id, token=token, code_hash=code_hash, expires_at=expires_at, ip_request=ip_request)
-    db.session.add(pr)
-    db.session.commit()
-
-def find_password_reset_by_token(token: str):
-    if not token:
-        return None
-    return PasswordReset.query.filter_by(token=token).first()
-
-def mark_password_reset_used(reset_id: int):
-    pr = PasswordReset.query.get(reset_id)
-    if pr:
-        pr.used = True
-        db.session.commit()
-
-def update_user_password(user_id: int, new_hash: str):
-    u = User.query.get(user_id)
-    if u:
-        u.password_hash = new_hash
-        db.session.commit()
-
-def db_fetch_url_by_code(code: str):
-    if not code:
-        return None
-    return URL.query.filter_by(code=code).first()
-
-def get_urls_for_user(user_id: int):
-    if not user_id:
-        return []
-    rows = URL.query.filter_by(owner_id=user_id).order_by(URL.created_at.desc()).limit(100).all()
-    return rows
-
-def create_url(owner_id, code, destination, is_private):
-    url = URL(owner_id=owner_id, code=code, destination=destination, is_private=bool(is_private), created_at=now_utc())
-    db.session.add(url)
-    db.session.commit()
-    # prime cache
-    cache_set_code(code, {
-        "id": url.id,
-        "owner_id": url.owner_id,
-        "code": url.code,
-        "destination": url.destination,
-        "is_private": url.is_private,
-    }, ttl=60)
-    return url
-
-def generate_random_code(length=6):
-    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(length))
-
-def create_unique_code(custom: str = None):
-    if custom:
-        if not ALIAS_RE.match(custom):
-            raise ValueError("Invalid custom alias")
-        if URL.query.filter_by(code=custom).first():
-            raise ValueError("Alias already in use")
-        return custom
-    attempt = 0
-    while True:
-        code = generate_random_code(6)
-        if not URL.query.filter_by(code=code).first():
-            return code
-        attempt += 1
-        if attempt > 20:
-            return generate_random_code(8)
-
-def validate_url(dest: str):
-    try:
-        parsed = urlparse(dest)
+        parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return False
         if not parsed.netloc:
@@ -533,549 +139,732 @@ def validate_url(dest: str):
         return False
 
 
-# --------------------
-# Email templates & simulated send
-# --------------------
-def load_email_template(name: str):
-    return EmailTemplate.query.get(name)
-
-def send_email(to: str, subject: str, html: str):
-    # Simulated send (print). Replace with SMTP/SES/SendGrid in production.
-    print("----- Simulated email -----")
-    print(f"To: {to}")
-    print(f"Subject: {subject}")
-    print("Body (HTML):")
-    print(html)
-    print("----- End email -----")
+def generate_code(length=SHORT_CODE_LENGTH) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-# --------------------
-# Async analytics: click recording
-# --------------------
-def enqueue_click_event(url_id: int, ip: str, ua: str, referer: str):
-    """
-    Fire-and-forget worker thread that records Click and increments URL.clicks_count.
-    We push an app_context to ensure SQLAlchemy session works inside the thread.
-    """
-    global _APP
-
-    def worker(app_ref, url_id_, ip_, ua_, referer_):
-        with app_ref.app_context():
-            try:
-                click = Click(url_id=url_id_, occurred_at=now_utc(), ip=ip_, user_agent=ua_, referer=referer_)
-                db.session.add(click)
-                # update count atomically within this DB session
-                url_obj = URL.query.get(url_id_)
-                if url_obj:
-                    url_obj.clicks_count = (url_obj.clicks_count or 0) + 1
-                db.session.commit()
-            except Exception as e:
-                # Print for demo; replace with proper logging
-                print("Error recording click:", e)
-
-    if _APP is None:
-        # cannot enqueue reliably without app context; skip recording (rare in dev)
-        return
-    t = threading.Thread(target=worker, args=(_APP, url_id, ip, ua, referer), daemon=True)
-    t.start()
+def require_login(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
 
 
-# --------------------
-# Session management (server-side)
-# --------------------
-def create_session(user_id: int, remember: bool = False):
-    sid = secrets.token_urlsafe(32)
-    created_at = now_utc()
-    expires = created_at + (timedelta(days=7) if remember else timedelta(days=1))
-    s = SessionModel(session_id=sid, user_id=user_id, created_at=created_at, expires_at=expires, data=None)
-    db.session.add(s)
-    db.session.commit()
-    return sid, expires
-
-def get_session(session_id: str):
-    if not session_id:
-        return None
-    s = SessionModel.query.get(session_id)
-    if not s:
-        return None
-    if s.expires_at < now_utc():
-        db.session.delete(s)
-        db.session.commit()
-        return None
-    return s
-
-def delete_session(session_id: str):
-    s = SessionModel.query.get(session_id)
-    if s:
-        db.session.delete(s)
-        db.session.commit()
-
-def invalidate_all_sessions_for_user(user_id: int):
-    SessionModel.query.filter_by(user_id=user_id).delete()
-    db.session.commit()
-
-
-# --------------------
-# Rate limiting (basic in-memory)
-# --------------------
-_RATE_LIMITS = {}  # ip -> [timestamps]
-_RATE_LOCK = threading.Lock()
-
-def check_rate_limit(ip: str, window_seconds=60, max_requests=20):
-    now = time.time()
-    with _RATE_LOCK:
-        lst = _RATE_LIMITS.setdefault(ip, [])
-        cutoff = now - window_seconds
-        # remove old
-        while lst and lst[0] < cutoff:
-            lst.pop(0)
-        if len(lst) >= max_requests:
-            return False
-        lst.append(now)
-    return True
-
-
-# --------------------
-# Current user helper
-# --------------------
 def get_current_user():
-    sid = request.cookies.get(SESSION_COOKIE_NAME)
-    if not sid:
+    if "user_id" not in session:
         return None
-    s = get_session(sid)
-    if not s:
-        return None
-    return load_user_by_id(s.user_id)
+    db = db_session()
+    try:
+        return db.query(User).filter_by(id=session["user_id"]).first()
+    finally:
+        db.close()
 
 
-# --------------------
-# Helpers for BASE_URL (AC1)
-# --------------------
-def app_base_url():
-    """
-    Return configured BASE_URL (from app config) if present and valid, otherwise fallback to request.url_root.
-    Ensures no trailing slash.
-    """
-    base = current_app.config.get("BASE_URL")
-    if base:
-        # basic validation
+def require_api_key(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        key = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if not key:
+            return jsonify({"error": "API key required"}), 401
+        db = db_session()
         try:
-            parsed = urlparse(base)
-            if parsed.scheme and parsed.netloc:
-                return base.rstrip("/")
-        except Exception:
-            pass
-    # fallback to runtime request root
-    return request.url_root.rstrip("/")
+            user = db.query(User).filter_by(api_key=key).first()
+            if not user:
+                return jsonify({"error": "Invalid API key"}), 403
+            request.api_user = user  # attach to request context for endpoint use
+            return view(*args, **kwargs)
+        finally:
+            db.close()
+    return wrapped
 
 
-def is_production_domain_active():
-    """
-    Determine whether the configured BASE_URL indicates a production domain (non-localhost/127.*).
-    """
-    base = current_app.config.get("BASE_URL")
-    if not base:
-        return False
-    try:
-        parsed = urlparse(base)
-        host = parsed.hostname or ""
-        if host.startswith("127.") or host == "localhost":
+# Simple in-memory rate limiter per key/ip
+class RateLimiter:
+    def __init__(self, per_minute):
+        self.per_minute = per_minute
+        self.access = defaultdict(lambda: deque())
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        window_start = now - 60
+        dq = self.access[key]
+        # pop outdated timestamps
+        while dq and dq[0] < window_start:
+            dq.popleft()
+        if len(dq) >= self.per_minute:
             return False
+        dq.append(now)
         return True
-    except Exception:
-        return False
 
 
-def base_url_uses_https():
-    base = current_app.config.get("BASE_URL") or ""
-    return base.lower().startswith("https://")
+redirect_rate_limiter = RateLimiter(REDIRECT_RATE_LIMIT_PER_MIN)
+api_rate_limiter = RateLimiter(API_RATE_LIMIT_PER_MIN)
 
 
-# --------------------
-# Routes
-# --------------------
-@shortly_bp.before_app_request
-def enforce_https_if_configured():
-    """
-    AC3: If BASE_URL is configured with https and points to a non-localhost domain,
-    upgrade incoming HTTP requests to HTTPS (respecting X-Forwarded-Proto for reverse proxies).
-    """
-    # Only enforce for non-GET assets and for real requests (skip CLI, static etc.)
-    if not request.host:
-        return
-    # Get configured base
-    if not is_production_domain_active() or not base_url_uses_https():
-        return
-    # Determine whether the incoming request is already secure.
-    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
-    if (request.is_secure or forwarded_proto.lower() == "https"):
-        return
-    # If the incoming host does not match configured domain, we don't force.
-    try:
-        expected_host = urlparse(current_app.config.get("BASE_URL")).netloc
-    except Exception:
-        expected_host = ""
-    if expected_host and request.host != expected_host:
-        # If host differs, do not force upgrade here; leave routing to proxy or other rules.
-        return
-    # Upgrade to https preserving path and querystring
-    url = request.url
-    secure_url = url.replace("http://", "https://", 1)
-    return redirect(secure_url, code=301)
+def rate_limit_for_ip(limit_obj):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+            if not limit_obj.is_allowed(ip):
+                return make_response("Too Many Requests", 429)
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
 
 
-@shortly_bp.route("/", methods=["GET"])
+# Fast in-memory cache for redirects: code -> (target_url, short_id, expiry_timestamp)
+redirect_cache = {}
+cache_lock = None  # For single-process demo not strictly necessary
+
+
+def cache_get(code):
+    ent = redirect_cache.get(code)
+    if not ent:
+        return None
+    target, sid, expiry = ent
+    if expiry < time.time():
+        del redirect_cache[code]
+        return None
+    return (target, sid)
+
+
+def cache_set(code, target, sid):
+    redirect_cache[code] = (target, sid, time.time() + CACHE_TTL_SECONDS)
+
+
+# CSRF token helpers
+def generate_csrf_token():
+    token = secrets.token_urlsafe(16)
+    session['_csrf_token'] = token
+    return token
+
+
+def validate_csrf(token):
+    saved = session.pop('_csrf_token', None)
+    return bool(saved and token and secrets.compare_digest(saved, token))
+
+
+# -----------------------
+# HTML Templates (render_template_string)
+# -----------------------
+BASE_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title or "URL Shortener" }}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; max-width:900px; margin:20px auto; color:#121212; }
+    header { margin-bottom: 1rem; }
+    .card { border: 1px solid #e3e3e3; padding: 1rem; border-radius:6px; background:#fff; }
+    input[type=text], input[type=password], textarea { width:100%; padding:8px; margin:6px 0 12px; border:1px solid #ddd; border-radius:4px; box-sizing:border-box; }
+    button { padding:8px 14px; border-radius:4px; border:0; background:#007bff; color:#fff; cursor:pointer; }
+    table { width:100%; border-collapse:collapse; margin-top:12px; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid #f1f1f1; }
+    .muted { color:#666; font-size:.9rem; }
+    nav a { margin-right:12px; }
+    .flash { padding:8px; background:#fff8d5; border:1px solid #f0e6a8; border-radius:4px; margin-bottom:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{{ title or "URL Shortener" }}</h1>
+    <nav>
+      {% if current_user %}
+        <span class="muted">Logged in as {{ current_user.username }}</span>
+        <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('logout') }}">Logout</a>
+      {% else %}
+        <a href="{{ url_for('login') }}">Login</a>
+        <a href="{{ url_for('register') }}">Register</a>
+      {% endif %}
+      <a href="{{ url_for('index') }}">Home</a>
+    </nav>
+  </header>
+
+  {% for msg in get_flashed_messages() %}
+    <div class="flash">{{ msg }}</div>
+  {% endfor %}
+
+  <main>
+    {{ content }}
+  </main>
+
+  <footer style="margin-top:2rem; color:#666; font-size:.9rem;">
+    <div>Powered by a surgical Flask + SQLAlchemy blueprint. No JavaScript backend.</div>
+  </footer>
+</body>
+</html>
+"""
+
+INDEX_CONTENT = """
+<div class="card">
+  <h2>Shorten a URL</h2>
+  <form method="post" action="{{ url_for('create_public') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Target URL</label>
+    <input type="text" name="target_url" placeholder="https://example.com/path" required>
+    <label>Custom code (optional)</label>
+    <input type="text" name="custom_code" placeholder="customCode">
+    <button type="submit">Shorten</button>
+  </form>
+  <p class="muted">You may register to manage links and access API keys for programmatic creation & stats.</p>
+</div>
+
+{% if created_short %}
+<div class="card" style="margin-top:12px;">
+  <h3>Short link created</h3>
+  <p><a href="{{ short_url }}" target="_blank">{{ short_url }}</a></p>
+  <p class="muted">Click to test redirect. Analytics will be recorded.</p>
+</div>
+{% endif %}
+"""
+
+LOGIN_CONTENT = """
+<div class="card">
+  <h2>Login</h2>
+  <form method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Username</label>
+    <input type="text" name="username" required>
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <button type="submit">Login</button>
+  </form>
+</div>
+"""
+
+REGISTER_CONTENT = """
+<div class="card">
+  <h2>Register</h2>
+  <form method="post" action="{{ url_for('register') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Username</label>
+    <input type="text" name="username" required>
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <button type="submit">Register</button>
+  </form>
+</div>
+"""
+
+DASHBOARD_CONTENT = """
+<div class="card">
+  <h2>Create Short Link</h2>
+  <form method="post" action="{{ url_for('create') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Target URL</label>
+    <input type="text" name="target_url" placeholder="https://example.com/path" required>
+    <label>Custom code (optional)</label>
+    <input type="text" name="custom_code" placeholder="customCode">
+    <button type="submit">Create</button>
+  </form>
+  <p class="muted">Your API key: <strong>{{ current_user.api_key }}</strong></p>
+</div>
+
+<div class="card" style="margin-top:12px;">
+  <h2>Your Links</h2>
+  {% if urls %}
+    <table>
+      <thead><tr><th>Short</th><th>Target</th><th>Visits</th><th>Created</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for u in urls %}
+        <tr>
+          <td><a href="{{ domain }}/r/{{ u.code }}" target="_blank">{{ domain }}/r/{{ u.code }}</a></td>
+          <td style="max-width:420px; overflow-wrap:anywhere;">{{ u.target_url }}</td>
+          <td>{{ u.visits }}</td>
+          <td>{{ u.created_at.strftime('%Y-%m-%d') }}</td>
+          <td><a href="{{ url_for('stats_ui', code=u.code) }}">Stats</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">You haven't created any links yet.</p>
+  {% endif %}
+</div>
+"""
+
+STATS_CONTENT = """
+<div class="card">
+  <h2>Stats for {{ domain }}/r/{{ code }}</h2>
+  <p>Target: <a href="{{ target }}" target="_blank">{{ target }}</a></p>
+  <p>Visits: {{ visits }}</p>
+  <h3>Recent Clicks</h3>
+  {% if clicks %}
+    <table>
+      <thead><tr><th>Time</th><th>IP</th><th>User Agent</th><th>Referrer</th></tr></thead>
+      <tbody>
+      {% for c in clicks %}
+        <tr>
+          <td>{{ c.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td>{{ c.ip }}</td>
+          <td style="max-width:420px; overflow-wrap:anywhere;">{{ c.user_agent }}</td>
+          <td style="max-width:240px; overflow-wrap:anywhere;">{{ c.referrer }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No clicks yet.</p>
+  {% endif %}
+</div>
+"""
+
+
+# -----------------------
+# Routes - UI
+# -----------------------
+@app.context_processor
+def inject_globals():
+    return {
+        "current_user": get_current_user(),
+        "domain": DEFAULT_DOMAIN,
+        "get_flashed_messages": get_flashed_messages,
+    }
+
+
+@app.route("/", methods=["GET"])
 def index():
-    user = get_current_user()
-    return render_with_layout(INDEX_HTML, current_user=user)
+    created_short = None
+    short_url = None
+    # If there was a previous creation result stored in session, display it once
+    if session.pop("_created_short", None):
+        created_short = True
+        short_url = session.pop("_created_short_url", None)
+    content = render_template_string(INDEX_CONTENT, created_short=created_short, short_url=short_url, csrf_token=generate_csrf_token())
+    return render_template_string(BASE_HTML, title="Home", content=content)
 
 
-@shortly_bp.route("/shorten-public", methods=["POST"])
-def shorten_public():
-    url = (request.form.get("url") or "").strip()
-    custom = (request.form.get("custom") or "").strip()
-    if not validate_url(url):
-        return render_with_message_and_template(INDEX_HTML, "Invalid URL (must be http/https)", kind="danger", current_user=get_current_user())
+@app.route("/create_public", methods=["POST"])
+def create_public():
+    # Allow public shortening (rate-limited)
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    if not api_rate_limiter.is_allowed(ip):  # reuse API limiter to avoid abuse
+        flash("Too many requests - try again later.")
+        return redirect(url_for("index"))
+
+    csrf_token = request.form.get("csrf_token")
+    if not validate_csrf(csrf_token):
+        flash("Invalid CSRF token.")
+        return redirect(url_for("index"))
+
+    target_url = (request.form.get("target_url") or "").strip()
+    custom_code = (request.form.get("custom_code") or "").strip()
+
+    if not is_valid_url(target_url):
+        flash("Invalid URL. Use http:// or https://")
+        return redirect(url_for("index"))
+
+    db = db_session()
     try:
-        code = create_unique_code(custom if custom else None)
-    except ValueError as e:
-        return render_with_message_and_template(INDEX_HTML, str(e), kind="danger", current_user=get_current_user())
-    create_url(None, code, url, is_private=False)
-    base = app_base_url()
-    message_html = f"<p class='success'>Short URL created: <a class='short-url' href='{base}/{code}'>{base}/{code}</a></p>"
-    return render_with_layout(message_html + INDEX_HTML, current_user=get_current_user())
+        if custom_code:
+            code = custom_code
+            # enforce alphanumeric and dash/underscore only for safety
+            if not all(c.isalnum() or c in "-_" for c in code):
+                flash("Custom code may only contain letters, numbers, - and _")
+                return redirect(url_for("index"))
+            # check uniqueness
+            exists = db.query(ShortURL).filter_by(code=code).first()
+            if exists:
+                flash("Custom code is already in use. Choose another.")
+                return redirect(url_for("index"))
+        else:
+            # generate unique code (with retries)
+            for _ in range(6):
+                code = generate_code()
+                if not db.query(ShortURL).filter_by(code=code).first():
+                    break
+            else:
+                flash("Could not generate a unique short code. Try again.")
+                return redirect(url_for("index"))
+
+        su = ShortURL(code=code, target_url=target_url, owner_id=None)
+        db.add(su)
+        db.commit()
+        session["_created_short"] = True
+        session["_created_short_url"] = f"{DEFAULT_DOMAIN}/r/{code}"
+        flash("Short URL created.")
+        return redirect(url_for("index"))
+    except Exception as e:
+        db.rollback()
+        app.logger.exception("Error creating public short URL")
+        flash("Error creating short URL.")
+        return redirect(url_for("index"))
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "GET":
-        return render_with_layout(REGISTER_HTML, current_user=get_current_user())
-    username = (request.form.get("username") or "").strip()
-    email = (request.form.get("email") or "").strip().lower()
-    password = request.form.get("password") or ""
-    password2 = request.form.get("password2") or ""
-    if not username or not email or not password:
-        return render_with_message_and_template(REGISTER_HTML, "Missing fields", kind="danger", current_user=get_current_user())
-    if password != password2:
-        return render_with_message_and_template(REGISTER_HTML, "Passwords do not match", kind="danger", current_user=get_current_user())
-    # uniqueness checks
-    if User.query.filter(User.username.ilike(username)).first():
-        return render_with_message_and_template(REGISTER_HTML, "Username already exists", kind="danger", current_user=get_current_user())
-    if find_user_by_email(email):
-        return render_with_message_and_template(REGISTER_HTML, "Email already registered", kind="danger", current_user=get_current_user())
-    pw_hash = generate_password_hash(password)
-    user = create_user_record(username=username, email=email, password_hash=pw_hash)
-    # create email verification
-    token = secrets.token_urlsafe(32)
-    code = secrets.token_hex(3)  # short code
-    code_hash = hashlib.sha256(code.encode()).hexdigest()
-    expires_at = now_utc() + timedelta(hours=24)
-    create_email_verification(user.id, code_hash, token, expires_at, ip_request=request.remote_addr)
-    tpl = load_email_template("email_verification")
-    if tpl:
-        verify_url = app_base_url() + "/email-verify/" + token
-        body = render_template_string(tpl.body_template, user=user, code=code, verify_url=verify_url, minutes=24 * 60)
-        send_email(user.email, tpl.subject_template, body)
-    return render_with_layout("<p class='success'>Account created. Check your email for verification.</p>", current_user=None)
-
-
-@shortly_bp.route("/login", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
-        return render_with_layout(LOGIN_HTML, current_user=get_current_user())
-    identifier = (request.form.get("username") or "").strip()
+        content = render_template_string(LOGIN_CONTENT, csrf_token=generate_csrf_token())
+        return render_template_string(BASE_HTML, title="Login", content=content)
+
+    csrf_token = request.form.get("csrf_token")
+    if not validate_csrf(csrf_token):
+        flash("Invalid CSRF token.")
+        return redirect(url_for("login"))
+
+    username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
-    remember = True if request.form.get("remember") else False
-    if not identifier or not password:
-        return render_with_message_and_template(LOGIN_HTML, "Missing credentials", kind="danger", current_user=get_current_user())
-    user = find_user_by_username_or_email(identifier)
-    if not user or not check_password_hash(user.password_hash, password):
-        return render_with_message_and_template(LOGIN_HTML, "Invalid credentials", kind="danger", current_user=None)
-    sid, expires = create_session(user.id, remember=remember)
-    resp = make_response(redirect("/dashboard"))
-    # Set secure flag for session cookie based on configured BASE_URL (AC1 & AC3)
-    secure_flag = base_url_uses_https()
-    resp.set_cookie(
-        SESSION_COOKIE_NAME,
-        sid,
-        httponly=True,
-        secure=secure_flag,
-        samesite="Strict",
-        expires=expires,
-        path="/",
-    )
-    return resp
+
+    db = db_session()
+    try:
+        user = db.query(User).filter_by(username=username).first()
+        if user and user.verify_password(password):
+            session["user_id"] = user.id
+            flash("Logged in.")
+            next_url = request.args.get("next") or url_for("dashboard")
+            return redirect(next_url)
+        else:
+            flash("Invalid credentials.")
+            return redirect(url_for("login"))
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/logout", methods=["GET"])
+@app.route("/logout")
 def logout():
-    sid = request.cookies.get(SESSION_COOKIE_NAME)
-    if sid:
-        delete_session(sid)
-    resp = make_response(redirect("/"))
-    resp.set_cookie(SESSION_COOKIE_NAME, "", expires=0, httponly=True, samesite="Strict", path="/")
-    return resp
+    session.clear()
+    flash("Logged out.")
+    return redirect(url_for("index"))
 
 
-def require_login_redirect():
-    return redirect("/login")
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "GET":
+        content = render_template_string(REGISTER_CONTENT, csrf_token=generate_csrf_token())
+        return render_template_string(BASE_HTML, title="Register", content=content)
+
+    csrf_token = request.form.get("csrf_token")
+    if not validate_csrf(csrf_token):
+        flash("Invalid CSRF token.")
+        return redirect(url_for("register"))
+
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+
+    if not username or not password:
+        flash("Username and password are required.")
+        return redirect(url_for("register"))
+
+    db = db_session()
+    try:
+        existing = db.query(User).filter_by(username=username).first()
+        if existing:
+            flash("Username already taken.")
+            return redirect(url_for("register"))
+        api_key = secrets.token_hex(32)
+        user = User(username=username, password_hash=generate_password_hash(password), api_key=api_key)
+        db.add(user)
+        db.commit()
+        flash("Registered. Please log in.")
+        return redirect(url_for("login"))
+    except Exception:
+        db.rollback()
+        app.logger.exception("Registration error")
+        flash("Error during registration.")
+        return redirect(url_for("register"))
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/dashboard", methods=["GET"])
+@app.route("/dashboard", methods=["GET"])
+@require_login
 def dashboard():
     user = get_current_user()
-    if not user:
-        return require_login_redirect()
-    urls = get_urls_for_user(user.id)
-    base_url = current_app.config.get("BASE_URL") or request.url_root.rstrip("/")
-    # format created_at as string for display
-    urls_view = []
-    for u in urls:
-        urls_view.append({
-            "id": u.id,
-            "code": u.code,
-            "destination": u.destination,
-            "clicks_count": u.clicks_count,
-            "created_at": u.created_at.isoformat(sep=" ", timespec="seconds")
-        })
-    return render_with_layout(DASHBOARD_HTML, current_user=user, urls=urls_view, base_url=base_url)
-
-
-@shortly_bp.route("/dashboard/shorten", methods=["POST"])
-def dashboard_shorten():
-    user = get_current_user()
-    if not user:
-        return require_login_redirect()
-    destination = (request.form.get("url") or "").strip()
-    custom = (request.form.get("custom") or "").strip()
-    is_private = True if request.form.get("private") else False
-    if not validate_url(destination):
-        return render_with_message_and_template(DASHBOARD_HTML, "Invalid destination URL", kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=current_app.config.get("BASE_URL") or request.url_root.rstrip("/"))
+    db = db_session()
     try:
-        code = create_unique_code(custom if custom else None)
-    except ValueError as e:
-        return render_with_message_and_template(DASHBOARD_HTML, str(e), kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=current_app.config.get("BASE_URL") or request.url_root.rstrip("/"))
-    create_url(owner_id=user.id, code=code, destination=destination, is_private=is_private)
-    return redirect("/dashboard")
+        urls = db.query(ShortURL).filter_by(owner_id=user.id).order_by(ShortURL.created_at.desc()).all()
+        content = render_template_string(DASHBOARD_CONTENT, urls=urls, csrf_token=generate_csrf_token())
+        return render_template_string(BASE_HTML, title="Dashboard", content=content)
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/dashboard/url/<int:url_id>", methods=["GET"])
-def dashboard_manage_url(url_id):
+@app.route("/create", methods=["POST"])
+@require_login
+def create():
+    csrf_token = request.form.get("csrf_token")
+    if not validate_csrf(csrf_token):
+        flash("Invalid CSRF token.")
+        return redirect(url_for("dashboard"))
+
+    target_url = (request.form.get("target_url") or "").strip()
+    custom_code = (request.form.get("custom_code") or "").strip()
+
+    if not is_valid_url(target_url):
+        flash("Invalid URL.")
+        return redirect(url_for("dashboard"))
+
     user = get_current_user()
-    if not user:
-        return require_login_redirect()
-    u = URL.query.filter_by(id=url_id, owner_id=user.id).first()
-    if not u:
-        return render_with_layout("<h1>Not found</h1><p class='muted'>You don't have access to that resource.</p>", current_user=user), 404
-    base_url = current_app.config.get("BASE_URL") or request.url_root.rstrip("/")
-    content = f"""
-    <h1>Manage URL</h1>
-    <p>Short: <span class='short-url'>{base_url}/{u.code}</span></p>
-    <p>Destination: <a href="{u.destination}" target="_blank">{u.destination}</a></p>
-    <p>Clicks: {u.clicks_count}</p>
-    <p>Created: {u.created_at}</p>
-    <p class='muted'>Analytics and edit features would appear here (demo).</p>
-    """
-    return render_with_layout(content, current_user=user)
+    db = db_session()
+    try:
+        if custom_code:
+            code = custom_code
+            if not all(c.isalnum() or c in "-_" for c in code):
+                flash("Custom code may only contain letters, numbers, - and _")
+                return redirect(url_for("dashboard"))
+            if db.query(ShortURL).filter_by(code=code).first():
+                flash("Custom code is already in use.")
+                return redirect(url_for("dashboard"))
+        else:
+            for _ in range(6):
+                code = generate_code()
+                if not db.query(ShortURL).filter_by(code=code).first():
+                    break
+            else:
+                flash("Failed to generate code.")
+                return redirect(url_for("dashboard"))
+
+        su = ShortURL(code=code, target_url=target_url, owner_id=user.id)
+        db.add(su)
+        db.commit()
+        flash("Short URL created.")
+        return redirect(url_for("dashboard"))
+    except Exception:
+        db.rollback()
+        app.logger.exception("Error creating short URL")
+        flash("Error creating short URL.")
+        return redirect(url_for("dashboard"))
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/r/<code>", methods=["GET"])
+@app.route("/stats/<code>")
+@require_login
+def stats_ui(code):
+    user = get_current_user()
+    db = db_session()
+    try:
+        su = db.query(ShortURL).filter_by(code=code).first()
+        if not su:
+            flash("Short URL not found.")
+            return redirect(url_for("dashboard"))
+        if su.owner_id != user.id and not user.is_admin:
+            flash("Access denied to stats.")
+            return redirect(url_for("dashboard"))
+        clicks = db.query(Click).filter_by(short_id=su.id).order_by(Click.timestamp.desc()).limit(200).all()
+        content = render_template_string(STATS_CONTENT, code=code, target=su.target_url, visits=su.visits, clicks=clicks, csrf_token=generate_csrf_token())
+        return render_template_string(BASE_HTML, title=f"Stats - {code}", content=content)
+    finally:
+        db.close()
+
+
+# -----------------------
+# API Endpoints
+# -----------------------
+@app.route("/api/v1/shorten", methods=["POST"])
+@require_api_key
+def api_shorten():
+    # API rate limit per API key
+    key = request.headers.get("X-API-Key") or request.args.get("api_key") or "unknown"
+    if not api_rate_limiter.is_allowed(key):
+        return jsonify({"error": "rate_limited"}), 429
+
+    data = request.get_json() or {}
+    target = (data.get("url") or data.get("target") or "").strip()
+    custom = (data.get("custom_code") or "").strip()
+
+    if not is_valid_url(target):
+        return jsonify({"error": "invalid_url"}), 400
+
+    db = db_session()
+    try:
+        if custom:
+            code = custom
+            if not all(c.isalnum() or c in "-_" for c in code):
+                return jsonify({"error": "invalid_custom_code"}), 400
+            if db.query(ShortURL).filter_by(code=code).first():
+                return jsonify({"error": "custom_code_taken"}), 409
+        else:
+            for _ in range(8):
+                code = generate_code()
+                if not db.query(ShortURL).filter_by(code=code).first():
+                    break
+            else:
+                return jsonify({"error": "could_not_generate_code"}), 500
+
+        su = ShortURL(code=code, target_url=target, owner_id=request.api_user.id)
+        db.add(su)
+        db.commit()
+        return jsonify({"short_url": f"{DEFAULT_DOMAIN}/r/{code}", "code": code, "target": target}), 201
+    except IntegrityError:
+        db.rollback()
+        return jsonify({"error": "duplicate"}), 409
+    except Exception:
+        db.rollback()
+        app.logger.exception("API create error")
+        return jsonify({"error": "server_error"}), 500
+    finally:
+        db.close()
+
+
+@app.route("/api/v1/stats/<code>", methods=["GET"])
+@require_api_key
+def api_stats(code):
+    # API rate limit per API key
+    key = request.headers.get("X-API-Key") or request.args.get("api_key") or "unknown"
+    if not api_rate_limiter.is_allowed(key):
+        return jsonify({"error": "rate_limited"}), 429
+
+    db = db_session()
+    try:
+        su = db.query(ShortURL).filter_by(code=code).first()
+        if not su:
+            return jsonify({"error": "not_found"}), 404
+        # Allow only owner or admin
+        if su.owner_id != request.api_user.id and not request.api_user.is_admin:
+            return jsonify({"error": "forbidden"}), 403
+
+        total = su.visits
+        last_clicks = db.query(Click).filter_by(short_id=su.id).order_by(Click.timestamp.desc()).limit(100).all()
+        clicks_data = [{
+            "timestamp": c.timestamp.isoformat(),
+            "ip": c.ip,
+            "ua": c.user_agent,
+            "referrer": c.referrer
+        } for c in last_clicks]
+        return jsonify({"code": code, "target": su.target_url, "visits": total, "recent_clicks": clicks_data})
+    finally:
+        db.close()
+
+
+# -----------------------
+# Redirect Engine (blazing-fast)
+# -----------------------
+@app.route("/r/<code>", methods=["GET"])
+@rate_limit_for_ip(redirect_rate_limiter)
 def redirect_code(code):
     """
-    Existing redirect route under /r/<code>. Keeps existing behavior (302).
+    High-performance redirect handler:
+    - Check in-memory cache first to avoid DB roundtrip if possible.
+    - On cache miss, fetch minimal fields and populate cache.
+    - Record click (lightweight) and increment visit count. Use direct SQL to increment to minimize race overhead.
     """
-    # Check cache
-    obj = cache_get_code(code)
-    if not obj:
-        db_obj = db_fetch_url_by_code(code)
-        if not db_obj:
-            return render_with_layout("<h1>Not found</h1><p>The short link does not exist.</p>", current_user=get_current_user()), 404
-        obj = {
-            "id": db_obj.id,
-            "owner_id": db_obj.owner_id,
-            "code": db_obj.code,
-            "destination": db_obj.destination,
-            "is_private": db_obj.is_private,
-        }
-        cache_set_code(code, obj, ttl=60)
-    # privacy check
-    if obj.get("is_private"):
-        user = get_current_user()
-        if not user or user.id != obj.get("owner_id"):
-            return render_with_layout("<h1>Private link</h1><p>This link is private.</p>", current_user=get_current_user()), 403
-    # enqueue analytics
-    enqueue_click_event(obj["id"], ip=request.remote_addr or "", ua=request.headers.get("User-Agent", ""), referer=request.headers.get("Referer", ""))
-    # Use 302 for /r/<code> (existing behavior)
-    return redirect(obj["destination"], code=302)
+    # Try cache
+    cached = cache_get(code)
+    db = db_session()
+    try:
+        if cached:
+            target, sid = cached
+        else:
+            su = db.query(ShortURL.id, ShortURL.target_url).filter_by(code=code).first()
+            if not su:
+                # 404 fallback
+                return make_response("Not Found", 404)
+            sid = su.id
+            target = su.target_url
+            cache_set(code, target, sid)
+
+        # Record click - do not block redirect rendering; but since we're in a single-process app, we will attempt a quick insert
+        try:
+            ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+            ua = (request.headers.get("User-Agent") or "")[:1000]
+            ref = (request.headers.get("Referer") or "")[:1000]
+            click = Click(short_id=sid, ip=ip, user_agent=ua, referrer=ref)
+            db.add(click)
+            # Use an efficient atomic update for visits
+            # Minimal ORM approach: fetch object and increment then commit (acceptable for SQLite + low concurrency)
+            db.query(ShortURL).filter_by(id=sid).update({"visits": ShortURL.visits + 1})
+            db.commit()
+        except Exception:
+            db.rollback()
+            # non-fatal: log and continue with redirect
+            app.logger.exception("Error recording click")
+
+        # Build redirect response
+        resp = redirect(target, code=302)
+        # Security headers for redirect responses
+        resp.headers['Referrer-Policy'] = 'no-referrer-when-downgrade'
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        resp.headers['X-Frame-Options'] = 'DENY'
+        return resp
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/password-reset-request", methods=["GET", "POST"])
-def password_reset_request():
-    if request.method == "GET":
-        return render_with_layout(PASSWORD_RESET_REQUEST_HTML, current_user=get_current_user())
-    email = (request.form.get("email") or "").strip().lower()
-    user = find_user_by_email(email)
-    ip = request.remote_addr
-    if user:
-        if not check_rate_limit(ip, window_seconds=3600, max_requests=5):
-            return render_with_layout("<p>If an account with that email exists, a reset link has been sent.</p>", current_user=get_current_user())
-        token = secrets.token_urlsafe(32)
-        code = "".join(secrets.choice("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(6))
-        code_hash = hashlib.sha256(code.encode()).hexdigest()
-        expires_at = now_utc() + timedelta(hours=1)
-        create_password_reset_entry(user.id, token, code_hash, expires_at, ip_request=ip)
-        tpl = load_email_template("password_reset")
-        if tpl:
-            reset_url = app_base_url() + "/password-reset/" + token
-            html_body = render_template_string(tpl.body_template, user=user, code=code, reset_url=reset_url, minutes=60)
-            send_email(user.email, tpl.subject_template, html_body)
-    # neutral response
-    return render_with_layout("<p>If an account with that email exists, a reset link has been sent.</p>", current_user=get_current_user())
+# Optionally expose raw link info (public) - but avoid leaking owner info
+@app.route("/info/<code>", methods=["GET"])
+def info(code):
+    db = db_session()
+    try:
+        su = db.query(ShortURL).filter_by(code=code).first()
+        if not su:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify({
+            "code": code,
+            "target": su.target_url,
+            "visits": su.visits,
+            "created_at": su.created_at.isoformat()
+        })
+    finally:
+        db.close()
 
 
-@shortly_bp.route("/password-reset/<token>", methods=["GET", "POST"])
-def password_reset(token):
-    if request.method == "GET":
-        return render_with_layout(PASSWORD_RESET_HTML, current_user=get_current_user(), token=token)
-    code_submitted = (request.form.get("code") or "").strip()
-    password = request.form.get("password") or ""
-    password2 = request.form.get("password2") or ""
-    if password != password2:
-        return render_with_message_and_template(PASSWORD_RESET_HTML, "Passwords do not match", kind="danger", current_user=get_current_user(), token=token)
-    row = find_password_reset_by_token(token)
-    if not row:
-        return render_with_layout("<p>Reset token invalid or expired.</p>", current_user=get_current_user()), 400
-    if row.used:
-        return render_with_layout("<p>Reset token has already been used.</p>", current_user=get_current_user()), 400
-    if row.expires_at < now_utc():
-        return render_with_layout("<p>Reset token invalid or expired.</p>", current_user=get_current_user()), 400
-    if hashlib.sha256(code_submitted.encode()).hexdigest() != row.code_hash:
-        return render_with_message_and_template(PASSWORD_RESET_HTML, "Invalid code", kind="danger", current_user=get_current_user(), token=token)
-    new_hash = generate_password_hash(password)
-    update_user_password(row.user_id, new_hash)
-    mark_password_reset_used(row.id)
-    invalidate_all_sessions_for_user(row.user_id)
-    user = load_user_by_id(row.user_id)
-    if user:
-        send_email(user.email, "Your password has been changed", f"<p>Hello {user.username},</p><p>Your password was successfully changed. If this wasn't you, contact support.</p>")
-    return render_with_layout("<p class='success'>Password changed. You may now <a href='/login'>login</a>.</p>", current_user=None)
+# -----------------------
+# Security headers
+# -----------------------
+@app.after_request
+def set_security_headers(resp):
+    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('Referrer-Policy', 'no-referrer-when-downgrade')
+    resp.headers.setdefault('Content-Security-Policy', "default-src 'self'")
+    return resp
 
 
-# --------------------
-# AC2: Global redirection listener at root-level for 7-8 char slugs
-# This route intentionally sits near the end so explicit routes are matched first.
-# --------------------
-@shortly_bp.route("/<path:maybe_slug>", methods=["GET"])
-def root_slug_listener(maybe_slug):
-    """
-    AC2: If a request hits the root domain with a 7-8 character slug (e.g., /XyZ1234),
-    and that slug exists in the database, perform a permanent redirect to the destination.
-    This allows short URLs to be served directly from the apex domain:
-      https://digitalinteractif.com/AbC1234 -> original destination
-    This route will not interfere with other known endpoints, because explicit routes (e.g., /login, /r/<code>) are registered earlier.
-    """
-    # Ignore well-known endpoints (simple guard)
-    reserved = {
-        "login", "register", "dashboard", "logout", "r", "password-reset-request", "password-reset", "static", ""
-    }
-    # If path contains slashes, only consider single-segment slugs
-    if "/" in maybe_slug:
-        return render_with_layout("<h1>Not found</h1><p>The requested resource does not exist.</p>", current_user=get_current_user()), 404
-    slug = maybe_slug.strip()
-    if not slug or slug in reserved:
-        # Not a slug we should attempt to resolve here
-        return render_with_layout("<h1>Not found</h1><p>The requested resource does not exist.</p>", current_user=get_current_user()), 404
-    # Only handle 7-8 character alphanumeric slugs per AC2
-    if not ROOT_SLUG_RE.match(slug):
-        return render_with_layout("<h1>Not found</h1><p>The short link does not exist.</p>", current_user=get_current_user()), 404
-    # Lookup in cache/db
-    obj = cache_get_code(slug)
-    if not obj:
-        db_obj = db_fetch_url_by_code(slug)
-        if not db_obj:
-            return render_with_layout("<h1>Not found</h1><p>The short link does not exist.</p>", current_user=get_current_user()), 404
-        obj = {
-            "id": db_obj.id,
-            "owner_id": db_obj.owner_id,
-            "code": db_obj.code,
-            "destination": db_obj.destination,
-            "is_private": db_obj.is_private,
-        }
-        cache_set_code(slug, obj, ttl=60)
-    # privacy check
-    if obj.get("is_private"):
-        user = get_current_user()
-        if not user or user.id != obj.get("owner_id"):
-            return render_with_layout("<h1>Private link</h1><p>This link is private.</p>", current_user=get_current_user()), 403
-    # enqueue analytics
-    enqueue_click_event(obj["id"], ip=request.remote_addr or "", ua=request.headers.get("User-Agent", ""), referer=request.headers.get("Referer", ""))
-    # AC2: Global root redirect returns 301 (permanent). This can be changed to 302 if desired.
-    return redirect(obj["destination"], code=301)
+# -----------------------
+# CLI helper to create admin
+# -----------------------
+def create_admin_if_none():
+    db = db_session()
+    try:
+        admin = db.query(User).filter_by(is_admin=True).first()
+        if not admin:
+            username = "admin"
+            password = secrets.token_urlsafe(12)
+            api_key = secrets.token_hex(32)
+            admin = User(username=username, password_hash=generate_password_hash(password), api_key=api_key, is_admin=True)
+            db.add(admin)
+            db.commit()
+            print("Created admin user:")
+            print(f"  username: {username}")
+            print(f"  password: {password}")
+            print(f"  api_key: {api_key}")
+        else:
+            print("Admin already exists:", admin.username)
+    finally:
+        db.close()
 
 
-# --------------------
-# Initialization helpers
-# --------------------
-def _seed_email_templates():
-    if not EmailTemplate.query.get("password_reset"):
-        tpl = EmailTemplate(
-            name="password_reset",
-            subject_template="Reset your Shortly password",
-            body_template="<p>Hello {{ user.username }},</p><p>We received a password reset request. Use the code <strong>{{ code }}</strong> or click <a href='{{ reset_url }}'>this link</a> to reset your password. This link expires in {{ minutes }} minutes.</p><p>If you did not request this, ignore this email.</p>",
-        )
-        db.session.add(tpl)
-    if not EmailTemplate.query.get("email_verification"):
-        tpl = EmailTemplate(
-            name="email_verification",
-            subject_template="Verify your Shortly account",
-            body_template="<p>Hello {{ user.username }},</p><p>Welcome! Please verify your email by using this code <strong>{{ code }}</strong> or clicking <a href='{{ verify_url }}'>this link</a>. This expires in {{ minutes }} minutes.</p>",
-        )
-        db.session.add(tpl)
-    db.session.commit()
-
-
-def init_shortly_app(app: Flask):
-    """
-    Initialize the SQLAlchemy extension, create tables and seed templates.
-    Also configure BASE_URL from environment variable 'BASE_URL' (AC1).
-    Must be called before registering the blueprint or before first request.
-    """
-    global _APP
-    _APP = app
-    # Load BASE_URL from environment into app.config for use throughout the app
-    # The environment variable should be set in production (e.g., BASE_URL=https://digitalinteractif.com)
-    base_from_env = os.environ.get("BASE_URL")
-    if base_from_env:
-        # Basic normalization: remove trailing slash
-        app.config["BASE_URL"] = base_from_env.rstrip("/")
-    else:
-        # Not configured: leave unset; functions will fallback to request.url_root
-        app.config.pop("BASE_URL", None)
-
-    db.init_app(app)
-    with app.app_context():
-        db.create_all()
-        _seed_email_templates()
-
-
-# --------------------
-# Standalone run support for demo (uses environment BASE_URL if set)
-# --------------------
-def create_app_for_demo(db_path: str = "sqlite:///shortly_demo_custom_domain.db"):
-    app = Flask(__name__)
-    app.config["SECRET_KEY"] = secrets.token_urlsafe(32)
-    app.config["SQLALCHEMY_DATABASE_URI"] = db_path
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    # allow override BASE_URL via environment before init_shortly_app (init reads env)
-    init_shortly_app(app)
-    app.register_blueprint(shortly_bp)
-    return app
-
-
+# -----------------------
+# Run
+# -----------------------
 if __name__ == "__main__":
-    demo_app = create_app_for_demo()
-    # Inform about configured BASE_URL for clarity (AC1)
-    configured = demo_app.config.get("BASE_URL") or "not configured (falling back to localhost during requests)"
-    print(f"Starting Shortly demo (custom-domain-aware) with BASE_URL={configured}")
-    # In production, run behind Gunicorn/Nginx on ports 80/443; demo uses Flask dev server only.
-    demo_app.run(debug=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the Flask URL Shortener service")
+    parser.add_argument("--init-admin", action="store_true", help="Create an admin user if none exist (prints credentials)")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", default=5000, type=int)
+    args = parser.parse_args()
+
+    if args.init_admin:
+        create_admin_if_none()
+
+    # Ensure DB file exists and is writable
+    if not os.path.exists(DB_PATH):
+        # touch it by creating tables (already done above) but ensure directory
+        dirname = os.path.dirname(DB_PATH)
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+
+    # Start Flask app
+    app.run(host=args.host, port=args.port, debug=False)
