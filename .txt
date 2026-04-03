@@ -1,0 +1,111 @@
+Rate limits
+Set rate limits for models in this project. Rate limits are inherited from the organization unless overridden.
+Model	Tokens / min (TPM)	Request and other limits	
+Chat
+gpt-4.1
+Shared limits:
+gpt-4.1-2025-04-14
+gpt-4.1-2025-04-14-shared
+ft:gpt-4.1
+30,000
+ /
+30,000 TPM
+500
+ /
+500 RPM
+gpt-4.1-mini
+Shared limits:
+gpt-4.1-mini-2025-04-14
+gpt-4.1-mini-2025-04-14-shared
+ft:gpt-4.1-mini
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+gpt-4.1-nano
+Shared limits:
+gpt-4.1-nano-2025-04-14
+gpt-4.1-nano-2025-04-14-shared
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+gpt-4o-mini
+Shared limits:
+gpt-4o-mini-2024-07-18
+gpt-4o-mini-2024-07-18-shared
+gpt-4o-mini-2024-07-18-alpha-shared
+gpt-4o-mini-audio-preview
+gpt-4o-mini-audio-preview-2024-12-17
+ft:gpt-4o-mini
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+gpt-5
+Shared limits:
+gpt-5-2025-08-07
+500,000
+ /
+500,000 TPM
+500
+ /
+500 RPM
+gpt-5-codex
+Shared limits:
+gpt-5-codex
+500,000
+ /
+500,000 TPM
+500
+ /
+500 RPM
+gpt-5-mini
+Shared limits:
+gpt-5-mini-2025-08-07
+500,000
+ /
+500,000 TPM
+500
+ /
+500 RPM
+gpt-5-nano
+Shared limits:
+gpt-5-nano-2025-08-07
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+gpt-5.1-codex-mini
+Shared limits:
+gpt-5.1-codex-mini
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+Text
+o4-mini	
+200,000
+ /
+200,000 TPM
+500
+ /
+500 RPM
+Default
+*	
+250,000
+ /
+250,000 TPM
+3,000
+ /
+3,000 RPM
