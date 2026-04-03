@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "jira-scrum-project"
+version = "0.1.0"
+description = "AI agent project for JIRA/Scrum management"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+crewai = "^0.50.0"
+langchain = "^0.1.0"
+python-dotenv = "^1.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

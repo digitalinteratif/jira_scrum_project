@@ -1,0 +1,33 @@
+[[package]]
+name = "crewai"
+version = "0.50.0"
+description = "CrewAI framework for building AI agents"
+category = "main"
+optional = false
+python-versions = ">=3.9"
+
+[[package]]
+name = "langchain"
+version = "0.1.0"
+description = "LangChain framework"
+category = "main"
+optional = false
+python-versions = ">=3.9"
+
+[[package]]
+name = "python-dotenv"
+version = "1.0.0"
+description = "Python .env file loader"
+category = "main"
+optional = false
+python-versions = ">=3.7"
+
+[metadata]
+python-versions = "^3.9"
+lock-version = "2.0"
+content-hash = "abc123def456"
+
+[metadata.files]
+crewai = []
+langchain = []
+python-dotenv = []

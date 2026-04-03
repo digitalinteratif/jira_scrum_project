@@ -1,0 +1,14 @@
+version = 4
+requires-python = ">=3.9"
+
+[[package]]
+name = "crewai"
+version = "0.50.0"
+
+[[package]]
+name = "langchain"
+version = "0.1.0"
+
+[[package]]
+name = "python-dotenv"
+version = "1.0.0"
