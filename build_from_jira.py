@@ -31,35 +31,61 @@ logger = logging.getLogger("JiraBuilder")
 
 def parse_model_env(env_value, default):
     if not env_value: return default
+    # Extract name from pattern model='name' or just return the string
     match = re.search(r"model=['\"]([^'\"]+)['\"]", env_value)
     if match: return match.group(1)
     return env_value
 
-# --- 2. FETCH REQUIREMENTS ---
+# --- 2. FETCH REQUIREMENTS (Recursive Epic Retrieval) ---
 def get_ticket_details(ticket_id):
     logger.info(f"🔗 Connecting to Jira: {ticket_id}")
     jira_server = os.environ.get("JIRA_SERVER")
     jira_email = os.environ.get("JIRA_EMAIL")
     jira_token = os.environ.get("JIRA_API_TOKEN")
     jira_client = JIRA(options={'server': jira_server}, basic_auth=(jira_email, jira_token))
+    
     try:
         issue = jira_client.issue(ticket_id)
-        return f"TITLE: {issue.fields.summary}\n\nDESCRIPTION:\n{issue.fields.description}\n"
+        summary = issue.fields.summary
+        description = issue.fields.description or "No description provided."
+        
+        full_context = f"--- TARGET TICKET: {ticket_id} ---\nTITLE: {summary}\nDESCRIPTION:\n{description}\n"
+
+        # RECURSIVE CONTEXT: Check for Parent Epic
+        parent = getattr(issue.fields, 'parent', None)
+        epic_key = None
+        
+        # Check standard parent field or common Epic Link custom field
+        if parent:
+            epic_key = parent.key
+        elif hasattr(issue.fields, 'customfield_10011'): # Common Epic Link ID
+            epic_key = issue.fields.customfield_10011
+
+        if epic_key:
+            logger.info(f"🔍 Found Parent Epic: {epic_key}. Fetching global rules...")
+            epic_issue = jira_client.issue(epic_key)
+            epic_desc = epic_issue.fields.description or ""
+            full_context = f"--- GLOBAL FEATURE OVERVIEW (From Epic {epic_key}) ---\n{epic_desc}\n\n" + full_context
+        
+        return full_context
+
     except JIRAError as e:
+        logger.error(f"❌ Jira Error: {e.text}")
         return f"Error: {e.text}"
 
-# --- 3. RETRIEVE EXISTING CODE (With UI Check) ---
+# --- 3. RETRIEVE EXISTING CODE ---
 def get_existing_code():
     if os.path.exists(CODE_FILE):
         with open(CODE_FILE, "r", encoding="utf-8") as f:
             content = f.read()
-            # Safety check: If the code is missing UI markers, flag it for the Architect
-            if "render_template_string" not in content and "render_layout" not in content:
-                logger.warning("⚠️ Existing code appears to be 'headless'. Forcing UI implementation.")
-                return f"EXISTING CODE (HEADLESS):\n{content}\n\nNOTE: This code lacks a UI. You MUST add the HTML templates."
+            # Python Stack Lock Check
+            if "require(" in content or "const " in content:
+                logger.warning("⚠️ Non-Python code detected. Forcing clean Python rewrite.")
+                return "ERROR: Existing code is Javascript. You MUST ignore its structure and build in Python/Flask."
             return content
     return ""
 
+logger.info("Initializing context retrieval...")
 jira_requirements = get_ticket_details(TARGET_JIRA_TICKET)
 existing_context = get_existing_code()
 
@@ -93,32 +119,33 @@ coder_llm = LLM(model=code_model)
 
 # --- 6. THE AGENTS ---
 architect = Agent(
-    role='Full-Stack Python Architect',
-    goal='Design surgical updates that PRESERVE or ADD a functional HTML UI.',
-    backstory="""You are a full-stack expert. You understand that a 'headless' API 
-    is a failure for this project. You ensure every blueprint includes the 
-    HTML templates and the 'render_layout' wrapper. You never allow a UI-driven 
-    app to revert to a text-only API.""",
+    role='Full-Stack Security Architect',
+    goal='Design surgical updates following the Global Feature Overview and Story requirements.',
+    backstory="""You are a security-first architect. You STRICTLY follow the 
+    'Immutable Technology Stack' and 'Agent Contextual Awareness Rules'. 
+    You always verify that a plan includes CSRF tokens and uses the 
+    render_layout pattern. You never allow technology drift.""",
     llm=architect_llm,
     verbose=True
 )
 
 coder = Agent(
     role='Senior Python Developer',
-    goal='Implement the blueprint in Python/Flask with a persistent HTML UI.',
-    backstory="""You write production-ready Python. You ensure the '/' route 
-    serves a beautiful HTML index page. You surgically merge new logic 
-    without deleting the existing template strings or the UI layout wrapper.""",
+    goal='Implement the blueprint in Python/Flask, ensuring global standards are met.',
+    backstory="""You specialize in high-precision Python. You ensure that 
+    every form has a CSRF token and that the single-file constraint is 
+    maintained. You merge Story requirements into the existing code without 
+    breaking the global rules defined in the Epic overview.""",
     llm=coder_llm,
     verbose=True
 )
 
 qa_auditor = Agent(
-    role='Python QA Auditor',
-    goal='Ensure the app has a functional UI and correct Domain settings.',
-    backstory="""You check the generated code. If the root route serves 
-    plain text instead of HTML, you REJECT it. You verify the BASE_URL 
-    points to digitalinteractif.com if specified in the .env.""",
+    role='Compliance & Security Auditor',
+    goal='Verify the code satisfies both the Story AND the Epic Overview standards.',
+    backstory="""You audit code for regressions and compliance. You reject 
+    any code that lacks CSRF tokens, attempts to use Javascript, or 
+    violates the single-file mandate. You verify BASE_URL and Domain logic.""",
     llm=coder_llm,
     verbose=True,
     tools=[python_tester_tool]
@@ -127,34 +154,35 @@ qa_auditor = Agent(
 # --- 7. THE TASKS ---
 blueprint_task = Task(
     description=(
-        f"Requirements:\n{jira_requirements}\n\nContext:\n{existing_context}\n\n"
-        "TASK: Create a SURGICAL Blueprint. MANDATORY: The resulting app MUST "
-        "have a functional HTML UI (Home, Login, Register, Dashboard). "
-        "Integrate the domain 'digitalinteractif.com' for all link generation."
+        f"Context & Requirements:\n{jira_requirements}\n\nExisting Code:\n{existing_context}\n\n"
+        "TASK: Create a SURGICAL Blueprint. You MUST:\n"
+        "1. Validate the plan against the GLOBAL FEATURE OVERVIEW (Section 2 & 4).\n"
+        "2. Address the specific Story requirements for the delta.\n"
+        "3. Ensure the render_layout and CSRF mandates are satisfied."
     ),
-    expected_output="A targeted Technical Specification mandating UI persistence.",
+    expected_output="A Technical Spec that satisfies both global and story-specific requirements.",
     agent=architect
 )
 
 coding_task = Task(
     description=(
-        "Write the COMPLETE updated Python Flask application.\n"
-        f"EXISTING SOURCE:\n{existing_context}\n\n"
-        "Rules: DO NOT return plain text for user routes. The index page MUST be HTML. "
-        "Use render_template_string and the layout wrapper helper."
+        "Update 'generated_app.py' surgically.\n"
+        f"SOURCE:\n{existing_context}\n\n"
+        "Rules: Maintain 100% Python/Flask. Ensure every <form> has CSRF tokens. "
+        "Use the render_layout helper. Preserve the single-file structure."
     ),
-    expected_output="The full updated Python script with UI and Domain logic.",
+    expected_output="The full updated Python script.",
     agent=coder,
     context=[blueprint_task]
 )
 
 audit_task = Task(
     description=(
-        "Audit for UI and syntax. Check 1: Does '/' return HTML? "
-        "Check 2: Does it use digitalinteractif.com for links? "
-        "Check 3: Run the stability test tool."
+        "Audit for Compliance. Check: CSRF tokens in forms, correct Domain usage, "
+        "and successful stability test. Your final response MUST be ONLY the "
+        "code in a ```python block."
     ),
-    expected_output="The finalized Python code in a ```python block.",
+    expected_output="The finalized, compliant Python code.",
     agent=qa_auditor,
     context=[coding_task]
 )
@@ -169,6 +197,6 @@ code_match = re.search(r'```python\n(.*?)\n```', output_string, re.DOTALL)
 if code_match:
     with open(CODE_FILE, "w", encoding="utf-8") as f:
         f.write(code_match.group(1))
-    print(f"\n🎉 SUCCESS! Python code with UI saved to '{CODE_FILE}'.")
+    print(f"\n🎉 SUCCESS! Context-aware surgical update for {TARGET_JIRA_TICKET} complete.")
 else:
     print("\n⛔ Failed to isolate Python code block.")
