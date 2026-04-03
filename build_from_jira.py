@@ -29,10 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("JiraBuilder")
 
-if not TARGET_JIRA_TICKET:
-    logger.error("TARGET_JIRA_TICKET not found in .env file.")
-    exit(1)
-
 def parse_model_env(env_value, default):
     if not env_value: return default
     match = re.search(r"model=['\"]([^'\"]+)['\"]", env_value)
@@ -48,20 +44,19 @@ def get_ticket_details(ticket_id):
     jira_client = JIRA(options={'server': jira_server}, basic_auth=(jira_email, jira_token))
     try:
         issue = jira_client.issue(ticket_id)
-        requirements_text = f"TITLE: {issue.fields.summary}\n\nDESCRIPTION:\n{issue.fields.description}\n"
-        return requirements_text
+        return f"TITLE: {issue.fields.summary}\n\nDESCRIPTION:\n{issue.fields.description}\n"
     except JIRAError as e:
         return f"Error: {e.text}"
 
-# --- 3. RETRIEVE EXISTING CODE ---
+# --- 3. RETRIEVE EXISTING CODE (With UI Check) ---
 def get_existing_code():
     if os.path.exists(CODE_FILE):
         with open(CODE_FILE, "r", encoding="utf-8") as f:
             content = f.read()
-            # If the file contains Node.js or Javascript, we tell the Architect it's an error
-            if "require('express')" in content or "const " in content:
-                logger.warning("⚠️ Detected non-Python code in generated_app.py. Instructing Architect to RE-ARCHITECT in Python.")
-                return "ERROR: The existing file is written in Javascript. You MUST ignore its structure and REWRITE it entirely in Python/Flask."
+            # Safety check: If the code is missing UI markers, flag it for the Architect
+            if "render_template_string" not in content and "render_layout" not in content:
+                logger.warning("⚠️ Existing code appears to be 'headless'. Forcing UI implementation.")
+                return f"EXISTING CODE (HEADLESS):\n{content}\n\nNOTE: This code lacks a UI. You MUST add the HTML templates."
             return content
     return ""
 
@@ -91,37 +86,39 @@ class PythonTesterTool(BaseTool):
 python_tester_tool = PythonTesterTool()
 
 # --- 5. THE MODELS ---
-arch_model = parse_model_env(os.environ.get("architect_llm"), "gpt-5-mini-2025-08-07")
-code_model = parse_model_env(os.environ.get("coder_llm"), "gpt-5-mini-2025-08-07")
+arch_model = parse_model_env(os.environ.get("architect_llm"), "o3-mini")
+code_model = parse_model_env(os.environ.get("coder_llm"), "gpt-5-codex")
 architect_llm = LLM(model=arch_model)
 coder_llm = LLM(model=code_model)
 
 # --- 6. THE AGENTS ---
 architect = Agent(
-    role='Python/Flask Architect',
-    goal='Design a surgical Python/Flask blueprint. NO OTHER LANGUAGES ALLOWED.',
-    backstory="""You are a Python specialist. You strictly use Flask and SQLAlchemy with SQLite. 
-    You forbid the use of Node.js, Express, or Javascript for backend logic. You ensure 
-    the blueprint mandates a functional HTML UI served via render_template_string.""",
+    role='Full-Stack Python Architect',
+    goal='Design surgical updates that PRESERVE or ADD a functional HTML UI.',
+    backstory="""You are a full-stack expert. You understand that a 'headless' API 
+    is a failure for this project. You ensure every blueprint includes the 
+    HTML templates and the 'render_layout' wrapper. You never allow a UI-driven 
+    app to revert to a text-only API.""",
     llm=architect_llm,
     verbose=True
 )
 
 coder = Agent(
     role='Senior Python Developer',
-    goal='Implement the Python/Flask blueprint into a single runnable file.',
-    backstory="""You only write Python. You never write scripts that 'create' other files. 
-    You write the actual Flask application. You ensure the index route serves a full 
-    HTML page, not just a message. You preserve existing Python logic surgically.""",
+    goal='Implement the blueprint in Python/Flask with a persistent HTML UI.',
+    backstory="""You write production-ready Python. You ensure the '/' route 
+    serves a beautiful HTML index page. You surgically merge new logic 
+    without deleting the existing template strings or the UI layout wrapper.""",
     llm=coder_llm,
     verbose=True
 )
 
 qa_auditor = Agent(
     role='Python QA Auditor',
-    goal='Verify the code is valid Python/Flask and includes a functional UI.',
-    backstory="""You reject any code that is not Python. You verify that the Flask 
-    server includes HTML templates and functional routes. You run the stability test.""",
+    goal='Ensure the app has a functional UI and correct Domain settings.',
+    backstory="""You check the generated code. If the root route serves 
+    plain text instead of HTML, you REJECT it. You verify the BASE_URL 
+    points to digitalinteractif.com if specified in the .env.""",
     llm=coder_llm,
     verbose=True,
     tools=[python_tester_tool]
@@ -131,27 +128,32 @@ qa_auditor = Agent(
 blueprint_task = Task(
     description=(
         f"Requirements:\n{jira_requirements}\n\nContext:\n{existing_context}\n\n"
-        "TASK: Create a SURGICAL Blueprint in PYTHON/FLASK. "
-        "Mandate: Use render_template_string for a UI including Login and Dashboard. "
-        "Strictly ignore any existing Node.js/Javascript code and replace it with Python."
+        "TASK: Create a SURGICAL Blueprint. MANDATORY: The resulting app MUST "
+        "have a functional HTML UI (Home, Login, Register, Dashboard). "
+        "Integrate the domain 'digitalinteractif.com' for all link generation."
     ),
-    expected_output="A targeted Python/Flask Technical Specification.",
+    expected_output="A targeted Technical Specification mandating UI persistence.",
     agent=architect
 )
 
 coding_task = Task(
     description=(
-        "Write the COMPLETE updated Python Flask application in ONE file. "
-        "You must include the HTML templates for the UI. "
-        "Do NOT write a setup script; write the application itself."
+        "Write the COMPLETE updated Python Flask application.\n"
+        f"EXISTING SOURCE:\n{existing_context}\n\n"
+        "Rules: DO NOT return plain text for user routes. The index page MUST be HTML. "
+        "Use render_template_string and the layout wrapper helper."
     ),
-    expected_output="The full updated Python script.",
+    expected_output="The full updated Python script with UI and Domain logic.",
     agent=coder,
     context=[blueprint_task]
 )
 
 audit_task = Task(
-    description="Audit for Python syntax and UI presence. Run the tester tool.",
+    description=(
+        "Audit for UI and syntax. Check 1: Does '/' return HTML? "
+        "Check 2: Does it use digitalinteractif.com for links? "
+        "Check 3: Run the stability test tool."
+    ),
     expected_output="The finalized Python code in a ```python block.",
     agent=qa_auditor,
     context=[coding_task]
@@ -167,6 +169,6 @@ code_match = re.search(r'```python\n(.*?)\n```', output_string, re.DOTALL)
 if code_match:
     with open(CODE_FILE, "w", encoding="utf-8") as f:
         f.write(code_match.group(1))
-    print(f"\n🎉 SUCCESS! Python code saved to '{CODE_FILE}'. Run it with 'python {CODE_FILE}'")
+    print(f"\n🎉 SUCCESS! Python code with UI saved to '{CODE_FILE}'.")
 else:
     print("\n⛔ Failed to isolate Python code block.")
