@@ -1,53 +1,67 @@
 #!/usr/bin/env python3
 """
-Surgical Blueprint: High-Performance URL Shortening Web Service (Flask + SQLAlchemy)
+Surgical Blueprint: Custom Domain Integration for URL Redirection (Flask + SQLAlchemy)
 
-- Provides a Flask Blueprint (shortly_bp) that implements:
-  - UI served via render_template_string (Login, Register, Dashboard, index, password reset, shortener)
-  - Server-side sessions stored in the database (opaque session_id cookie)
-  - Secure password hashing (werkzeug PBKDF2; replace with Argon2 in production)
-  - Redirect handler with tiny in-memory TTL cache for speed
-  - Asynchronous click recording into SQLite via worker thread (uses app.app_context)
-  - Owner-scoped resource access for security
-  - Simulated email sending (prints rendered HTML emails)
-- Uses SQLAlchemy ORM exclusively (no raw sqlite3).
-- No Node.js / JavaScript backend usage; UI is rendered server-side.
+Purpose:
+- Implements a small, self-contained Flask Blueprint (shortly_bp) that provides:
+  - UI using render_template_string (index, register, login, dashboard, password reset, shortener)
+  - Short URL generation that uses a configurable BASE_URL (from environment/.env)
+  - Root-domain slug listener: requests to /<7-8 char slug> redirect to destination
+  - HTTPS upgrade when BASE_URL is configured with https:// (checks X-Forwarded-Proto)
+  - Server-side sessions, secure password hashing, redirect cache and analytics enqueue
+
+Notes:
+- Uses only Python + Flask + SQLAlchemy + SQLite
+- No Node.js or backend JavaScript is used
+- Blueprint UI is server-rendered via render_template_string
+- To configure production domain, set environment variable BASE_URL (e.g., https://digitalinteractif.com)
+- Optional: install python-dotenv to load .env files (load_dotenv is used if available)
 
 Usage:
     from flask import Flask
-    from shortly_blueprint import shortly_bp, init_shortly_app
+    from shortly_custom_domain import shortly_bp, init_shortly_app
 
     app = Flask(__name__)
     app.config['SECRET_KEY'] = 'replace-with-secure-random'
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shortly_demo_sqlalchemy.db'
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shortly_demo_custom_domain.db'
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-    init_shortly_app(app)      # initializes DB, email templates etc.
+    init_shortly_app(app)      # initializes DB, config (BASE_URL from env), email templates etc.
     app.register_blueprint(shortly_bp)
 
     app.run(debug=True)
 """
 
-from flask import (
-    Blueprint,
-    current_app,
-    Flask,
-    make_response,
-    redirect,
-    render_template_string,
-    request,
-    url_for,
-)
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import check_password_hash, generate_password_hash
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-import threading
+import os
+import re
+import uuid
 import time
 import secrets
 import hashlib
-import uuid
-import re
+import threading
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, urljoin
+
+from flask import (
+    Blueprint,
+    Flask,
+    current_app,
+    request,
+    redirect,
+    render_template_string,
+    make_response,
+)
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Optional dotenv loading (graceful if not installed)
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    # ignore if python-dotenv not present; environment variables can still be used
+    pass
 
 # SQLAlchemy instance (initialized in init_shortly_app)
 db = SQLAlchemy()
@@ -59,7 +73,7 @@ shortly_bp = Blueprint("shortly", __name__)
 _APP = None
 
 # --------------------
-# Templates (strings)
+# Templates (strings) - UI served via render_template_string
 # --------------------
 LAYOUT = """
 <!doctype html>
@@ -218,7 +232,7 @@ DASHBOARD_HTML = """
       <tbody>
       {% for u in urls %}
         <tr>
-          <td class="short-url"><a href="{{ base_url }}/r/{{ u.code }}">{{ base_url }}/r/{{ u.code }}</a></td>
+          <td class="short-url"><a href="{{ base_url }}/{{ u.code }}">{{ base_url }}/{{ u.code }}</a></td>
           <td><a href="{{ u.destination }}" target="_blank" rel="noopener">{{ u.destination }}</a></td>
           <td>{{ u.clicks_count }}</td>
           <td>{{ u.created_at }}</td>
@@ -378,12 +392,12 @@ def render_with_message_and_template(template_str, message=None, kind="danger", 
 
 
 # --------------------
-# Utilities
+# Utilities & constants
 # --------------------
 SESSION_COOKIE_NAME = "session_id"
 ALIAS_RE = re.compile(r"^[A-Za-z0-9_\-]{2,64}$")
 _CODE_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
+ROOT_SLUG_RE = re.compile(r"^[A-Za-z0-9]{7,8}$")  # AC2: 7-8 character slugs (letters/digits)
 
 def now_utc():
     return datetime.utcnow()
@@ -395,11 +409,9 @@ def now_utc():
 _redirect_cache = {}
 _cache_lock = threading.Lock()
 
-
 def cache_set_code(code: str, obj: dict, ttl: int = 60):
     with _cache_lock:
         _redirect_cache[code] = {"obj": obj, "expires": time.time() + ttl}
-
 
 def cache_get_code(code: str):
     with _cache_lock:
@@ -422,18 +434,15 @@ def find_user_by_username_or_email(identifier: str):
         (User.username.ilike(identifier)) | (User.email.ilike(identifier))
     ).first()
 
-
 def find_user_by_email(email: str):
     if not email:
         return None
     return User.query.filter(User.email.ilike(email)).first()
 
-
 def load_user_by_id(user_id: int):
     if not user_id:
         return None
     return User.query.get(user_id)
-
 
 def create_user_record(username: str, email: str, password_hash: str):
     u = User(username=username, email=email, password_hash=password_hash)
@@ -441,24 +450,20 @@ def create_user_record(username: str, email: str, password_hash: str):
     db.session.commit()
     return u
 
-
 def create_email_verification(user_id: int, code_hash: str, token: str, expires_at: datetime, ip_request: str = None):
     ev = EmailVerification(user_id=user_id, code_hash=code_hash, token=token, expires_at=expires_at, ip_request=ip_request)
     db.session.add(ev)
     db.session.commit()
-
 
 def create_password_reset_entry(user_id: int, token: str, code_hash: str, expires_at: datetime, ip_request: str = None):
     pr = PasswordReset(user_id=user_id, token=token, code_hash=code_hash, expires_at=expires_at, ip_request=ip_request)
     db.session.add(pr)
     db.session.commit()
 
-
 def find_password_reset_by_token(token: str):
     if not token:
         return None
     return PasswordReset.query.filter_by(token=token).first()
-
 
 def mark_password_reset_used(reset_id: int):
     pr = PasswordReset.query.get(reset_id)
@@ -466,26 +471,22 @@ def mark_password_reset_used(reset_id: int):
         pr.used = True
         db.session.commit()
 
-
 def update_user_password(user_id: int, new_hash: str):
     u = User.query.get(user_id)
     if u:
         u.password_hash = new_hash
         db.session.commit()
 
-
 def db_fetch_url_by_code(code: str):
     if not code:
         return None
     return URL.query.filter_by(code=code).first()
-
 
 def get_urls_for_user(user_id: int):
     if not user_id:
         return []
     rows = URL.query.filter_by(owner_id=user_id).order_by(URL.created_at.desc()).limit(100).all()
     return rows
-
 
 def create_url(owner_id, code, destination, is_private):
     url = URL(owner_id=owner_id, code=code, destination=destination, is_private=bool(is_private), created_at=now_utc())
@@ -501,10 +502,8 @@ def create_url(owner_id, code, destination, is_private):
     }, ttl=60)
     return url
 
-
 def generate_random_code(length=6):
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(length))
-
 
 def create_unique_code(custom: str = None):
     if custom:
@@ -521,7 +520,6 @@ def create_unique_code(custom: str = None):
         attempt += 1
         if attempt > 20:
             return generate_random_code(8)
-
 
 def validate_url(dest: str):
     try:
@@ -540,7 +538,6 @@ def validate_url(dest: str):
 # --------------------
 def load_email_template(name: str):
     return EmailTemplate.query.get(name)
-
 
 def send_email(to: str, subject: str, html: str):
     # Simulated send (print). Replace with SMTP/SES/SendGrid in production.
@@ -595,7 +592,6 @@ def create_session(user_id: int, remember: bool = False):
     db.session.commit()
     return sid, expires
 
-
 def get_session(session_id: str):
     if not session_id:
         return None
@@ -608,13 +604,11 @@ def get_session(session_id: str):
         return None
     return s
 
-
 def delete_session(session_id: str):
     s = SessionModel.query.get(session_id)
     if s:
         db.session.delete(s)
         db.session.commit()
-
 
 def invalidate_all_sessions_for_user(user_id: int):
     SessionModel.query.filter_by(user_id=user_id).delete()
@@ -626,7 +620,6 @@ def invalidate_all_sessions_for_user(user_id: int):
 # --------------------
 _RATE_LIMITS = {}  # ip -> [timestamps]
 _RATE_LOCK = threading.Lock()
-
 
 def check_rate_limit(ip: str, window_seconds=60, max_requests=20):
     now = time.time()
@@ -656,8 +649,81 @@ def get_current_user():
 
 
 # --------------------
+# Helpers for BASE_URL (AC1)
+# --------------------
+def app_base_url():
+    """
+    Return configured BASE_URL (from app config) if present and valid, otherwise fallback to request.url_root.
+    Ensures no trailing slash.
+    """
+    base = current_app.config.get("BASE_URL")
+    if base:
+        # basic validation
+        try:
+            parsed = urlparse(base)
+            if parsed.scheme and parsed.netloc:
+                return base.rstrip("/")
+        except Exception:
+            pass
+    # fallback to runtime request root
+    return request.url_root.rstrip("/")
+
+
+def is_production_domain_active():
+    """
+    Determine whether the configured BASE_URL indicates a production domain (non-localhost/127.*).
+    """
+    base = current_app.config.get("BASE_URL")
+    if not base:
+        return False
+    try:
+        parsed = urlparse(base)
+        host = parsed.hostname or ""
+        if host.startswith("127.") or host == "localhost":
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def base_url_uses_https():
+    base = current_app.config.get("BASE_URL") or ""
+    return base.lower().startswith("https://")
+
+
+# --------------------
 # Routes
 # --------------------
+@shortly_bp.before_app_request
+def enforce_https_if_configured():
+    """
+    AC3: If BASE_URL is configured with https and points to a non-localhost domain,
+    upgrade incoming HTTP requests to HTTPS (respecting X-Forwarded-Proto for reverse proxies).
+    """
+    # Only enforce for non-GET assets and for real requests (skip CLI, static etc.)
+    if not request.host:
+        return
+    # Get configured base
+    if not is_production_domain_active() or not base_url_uses_https():
+        return
+    # Determine whether the incoming request is already secure.
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+    if (request.is_secure or forwarded_proto.lower() == "https"):
+        return
+    # If the incoming host does not match configured domain, we don't force.
+    try:
+        expected_host = urlparse(current_app.config.get("BASE_URL")).netloc
+    except Exception:
+        expected_host = ""
+    if expected_host and request.host != expected_host:
+        # If host differs, do not force upgrade here; leave routing to proxy or other rules.
+        return
+    # Upgrade to https preserving path and querystring
+    url = request.url
+    secure_url = url.replace("http://", "https://", 1)
+    return redirect(secure_url, code=301)
+
+
 @shortly_bp.route("/", methods=["GET"])
 def index():
     user = get_current_user()
@@ -675,8 +741,8 @@ def shorten_public():
     except ValueError as e:
         return render_with_message_and_template(INDEX_HTML, str(e), kind="danger", current_user=get_current_user())
     create_url(None, code, url, is_private=False)
-    base = request.url_root.rstrip("/")
-    message_html = f"<p class='success'>Short URL created: <a class='short-url' href='{base}/r/{code}'>{base}/r/{code}</a></p>"
+    base = app_base_url()
+    message_html = f"<p class='success'>Short URL created: <a class='short-url' href='{base}/{code}'>{base}/{code}</a></p>"
     return render_with_layout(message_html + INDEX_HTML, current_user=get_current_user())
 
 
@@ -707,7 +773,7 @@ def register():
     create_email_verification(user.id, code_hash, token, expires_at, ip_request=request.remote_addr)
     tpl = load_email_template("email_verification")
     if tpl:
-        verify_url = request.url_root.rstrip("/") + "/email-verify/" + token
+        verify_url = app_base_url() + "/email-verify/" + token
         body = render_template_string(tpl.body_template, user=user, code=code, verify_url=verify_url, minutes=24 * 60)
         send_email(user.email, tpl.subject_template, body)
     return render_with_layout("<p class='success'>Account created. Check your email for verification.</p>", current_user=None)
@@ -727,7 +793,8 @@ def login():
         return render_with_message_and_template(LOGIN_HTML, "Invalid credentials", kind="danger", current_user=None)
     sid, expires = create_session(user.id, remember=remember)
     resp = make_response(redirect("/dashboard"))
-    secure_flag = request.is_secure
+    # Set secure flag for session cookie based on configured BASE_URL (AC1 & AC3)
+    secure_flag = base_url_uses_https()
     resp.set_cookie(
         SESSION_COOKIE_NAME,
         sid,
@@ -760,7 +827,7 @@ def dashboard():
     if not user:
         return require_login_redirect()
     urls = get_urls_for_user(user.id)
-    base_url = request.url_root.rstrip("/")
+    base_url = current_app.config.get("BASE_URL") or request.url_root.rstrip("/")
     # format created_at as string for display
     urls_view = []
     for u in urls:
@@ -783,11 +850,11 @@ def dashboard_shorten():
     custom = (request.form.get("custom") or "").strip()
     is_private = True if request.form.get("private") else False
     if not validate_url(destination):
-        return render_with_message_and_template(DASHBOARD_HTML, "Invalid destination URL", kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=request.url_root.rstrip("/"))
+        return render_with_message_and_template(DASHBOARD_HTML, "Invalid destination URL", kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=current_app.config.get("BASE_URL") or request.url_root.rstrip("/"))
     try:
         code = create_unique_code(custom if custom else None)
     except ValueError as e:
-        return render_with_message_and_template(DASHBOARD_HTML, str(e), kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=request.url_root.rstrip("/"))
+        return render_with_message_and_template(DASHBOARD_HTML, str(e), kind="danger", current_user=user, urls=get_urls_for_user(user.id), base_url=current_app.config.get("BASE_URL") or request.url_root.rstrip("/"))
     create_url(owner_id=user.id, code=code, destination=destination, is_private=is_private)
     return redirect("/dashboard")
 
@@ -800,10 +867,10 @@ def dashboard_manage_url(url_id):
     u = URL.query.filter_by(id=url_id, owner_id=user.id).first()
     if not u:
         return render_with_layout("<h1>Not found</h1><p class='muted'>You don't have access to that resource.</p>", current_user=user), 404
-    base_url = request.url_root.rstrip("/")
+    base_url = current_app.config.get("BASE_URL") or request.url_root.rstrip("/")
     content = f"""
     <h1>Manage URL</h1>
-    <p>Short: <span class='short-url'>{base_url}/r/{u.code}</span></p>
+    <p>Short: <span class='short-url'>{base_url}/{u.code}</span></p>
     <p>Destination: <a href="{u.destination}" target="_blank">{u.destination}</a></p>
     <p>Clicks: {u.clicks_count}</p>
     <p>Created: {u.created_at}</p>
@@ -814,6 +881,9 @@ def dashboard_manage_url(url_id):
 
 @shortly_bp.route("/r/<code>", methods=["GET"])
 def redirect_code(code):
+    """
+    Existing redirect route under /r/<code>. Keeps existing behavior (302).
+    """
     # Check cache
     obj = cache_get_code(code)
     if not obj:
@@ -834,7 +904,8 @@ def redirect_code(code):
         if not user or user.id != obj.get("owner_id"):
             return render_with_layout("<h1>Private link</h1><p>This link is private.</p>", current_user=get_current_user()), 403
     # enqueue analytics
-    enqueue_click_event(obj["id"], ip=request.remote_addr, ua=request.headers.get("User-Agent", ""), referer=request.headers.get("Referer", ""))
+    enqueue_click_event(obj["id"], ip=request.remote_addr or "", ua=request.headers.get("User-Agent", ""), referer=request.headers.get("Referer", ""))
+    # Use 302 for /r/<code> (existing behavior)
     return redirect(obj["destination"], code=302)
 
 
@@ -855,7 +926,7 @@ def password_reset_request():
         create_password_reset_entry(user.id, token, code_hash, expires_at, ip_request=ip)
         tpl = load_email_template("password_reset")
         if tpl:
-            reset_url = request.url_root.rstrip("/") + "/password-reset/" + token
+            reset_url = app_base_url() + "/password-reset/" + token
             html_body = render_template_string(tpl.body_template, user=user, code=code, reset_url=reset_url, minutes=60)
             send_email(user.email, tpl.subject_template, html_body)
     # neutral response
@@ -891,6 +962,58 @@ def password_reset(token):
 
 
 # --------------------
+# AC2: Global redirection listener at root-level for 7-8 char slugs
+# This route intentionally sits near the end so explicit routes are matched first.
+# --------------------
+@shortly_bp.route("/<path:maybe_slug>", methods=["GET"])
+def root_slug_listener(maybe_slug):
+    """
+    AC2: If a request hits the root domain with a 7-8 character slug (e.g., /XyZ1234),
+    and that slug exists in the database, perform a permanent redirect to the destination.
+    This allows short URLs to be served directly from the apex domain:
+      https://digitalinteractif.com/AbC1234 -> original destination
+    This route will not interfere with other known endpoints, because explicit routes (e.g., /login, /r/<code>) are registered earlier.
+    """
+    # Ignore well-known endpoints (simple guard)
+    reserved = {
+        "login", "register", "dashboard", "logout", "r", "password-reset-request", "password-reset", "static", ""
+    }
+    # If path contains slashes, only consider single-segment slugs
+    if "/" in maybe_slug:
+        return render_with_layout("<h1>Not found</h1><p>The requested resource does not exist.</p>", current_user=get_current_user()), 404
+    slug = maybe_slug.strip()
+    if not slug or slug in reserved:
+        # Not a slug we should attempt to resolve here
+        return render_with_layout("<h1>Not found</h1><p>The requested resource does not exist.</p>", current_user=get_current_user()), 404
+    # Only handle 7-8 character alphanumeric slugs per AC2
+    if not ROOT_SLUG_RE.match(slug):
+        return render_with_layout("<h1>Not found</h1><p>The short link does not exist.</p>", current_user=get_current_user()), 404
+    # Lookup in cache/db
+    obj = cache_get_code(slug)
+    if not obj:
+        db_obj = db_fetch_url_by_code(slug)
+        if not db_obj:
+            return render_with_layout("<h1>Not found</h1><p>The short link does not exist.</p>", current_user=get_current_user()), 404
+        obj = {
+            "id": db_obj.id,
+            "owner_id": db_obj.owner_id,
+            "code": db_obj.code,
+            "destination": db_obj.destination,
+            "is_private": db_obj.is_private,
+        }
+        cache_set_code(slug, obj, ttl=60)
+    # privacy check
+    if obj.get("is_private"):
+        user = get_current_user()
+        if not user or user.id != obj.get("owner_id"):
+            return render_with_layout("<h1>Private link</h1><p>This link is private.</p>", current_user=get_current_user()), 403
+    # enqueue analytics
+    enqueue_click_event(obj["id"], ip=request.remote_addr or "", ua=request.headers.get("User-Agent", ""), referer=request.headers.get("Referer", ""))
+    # AC2: Global root redirect returns 301 (permanent). This can be changed to 302 if desired.
+    return redirect(obj["destination"], code=301)
+
+
+# --------------------
 # Initialization helpers
 # --------------------
 def _seed_email_templates():
@@ -914,10 +1037,21 @@ def _seed_email_templates():
 def init_shortly_app(app: Flask):
     """
     Initialize the SQLAlchemy extension, create tables and seed templates.
+    Also configure BASE_URL from environment variable 'BASE_URL' (AC1).
     Must be called before registering the blueprint or before first request.
     """
     global _APP
     _APP = app
+    # Load BASE_URL from environment into app.config for use throughout the app
+    # The environment variable should be set in production (e.g., BASE_URL=https://digitalinteractif.com)
+    base_from_env = os.environ.get("BASE_URL")
+    if base_from_env:
+        # Basic normalization: remove trailing slash
+        app.config["BASE_URL"] = base_from_env.rstrip("/")
+    else:
+        # Not configured: leave unset; functions will fallback to request.url_root
+        app.config.pop("BASE_URL", None)
+
     db.init_app(app)
     with app.app_context():
         db.create_all()
@@ -925,20 +1059,23 @@ def init_shortly_app(app: Flask):
 
 
 # --------------------
-# Standalone run support
+# Standalone run support for demo (uses environment BASE_URL if set)
 # --------------------
-def create_app_for_demo(db_path: str = "sqlite:///shortly_demo_sqlalchemy.db"):
+def create_app_for_demo(db_path: str = "sqlite:///shortly_demo_custom_domain.db"):
     app = Flask(__name__)
     app.config["SECRET_KEY"] = secrets.token_urlsafe(32)
     app.config["SQLALCHEMY_DATABASE_URI"] = db_path
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    # allow override BASE_URL via environment before init_shortly_app (init reads env)
     init_shortly_app(app)
     app.register_blueprint(shortly_bp)
     return app
 
 
-# If run directly, start demo server
 if __name__ == "__main__":
     demo_app = create_app_for_demo()
-    print("Starting Shortly demo (SQLAlchemy) on http://127.0.0.1:5000")
+    # Inform about configured BASE_URL for clarity (AC1)
+    configured = demo_app.config.get("BASE_URL") or "not configured (falling back to localhost during requests)"
+    print(f"Starting Shortly demo (custom-domain-aware) with BASE_URL={configured}")
+    # In production, run behind Gunicorn/Nginx on ports 80/443; demo uses Flask dev server only.
     demo_app.run(debug=True)

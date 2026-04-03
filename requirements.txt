@@ -1,0 +1,34 @@
+# Core Project Dependencies
+
+# AI/Agent Framework
+crewai>=1.13.0
+langchain>=0.1.0
+pydantic>=2.0.0
+openai>=1.0.0
+
+# Web Framework
+flask>=3.1.0
+flask-sqlalchemy>=3.1.0
+werkzeug>=3.0.0
+gunicorn>=21.0.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Jira Integration
+jira>=3.10.0
+
+# Security & Authentication
+argon2-cffi>=21.0.0
+pyjwt>=2.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Optional but Recommended for Production
+redis>=4.0.0
+flask-talisman>=1.0.0
+flask-wtf>=1.0.0
+
+# Database drivers
+sqlite3  # Built-in with Python
