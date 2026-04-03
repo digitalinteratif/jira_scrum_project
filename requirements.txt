@@ -20,15 +20,12 @@ jira>=3.10.0
 
 # Security & Authentication
 argon2-cffi>=21.0.0
-pyjwt>=2.0.0
+pyjwt>=2.12.1
 
 # Configuration
 python-dotenv>=1.0.0
 
 # Optional but Recommended for Production
 redis>=4.0.0
-flask-talisman>=1.0.0
-flask-wtf>=1.0.0
-
-# Database drivers
-sqlite3  # Built-in with Python
+flask-talisman>=1.1.0
+flask-wtf>=1.2.2
