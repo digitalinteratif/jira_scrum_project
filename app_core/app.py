@@ -1,6 +1,7 @@
 import os
 import logging
-from flask import Flask, render_template_string
+import traceback
+from flask import Flask, render_template_string, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from flask_talisman import Talisman
@@ -29,8 +30,6 @@ def create_app():
     # --- 2. DATABASE PATH RESILIENCY ---
     db_url = os.environ.get("DATABASE_URL", "sqlite:///shortener.db")
     
-    # If using the /data/ path but directory is missing (common on Render Free Tier), 
-    # fallback to root to prevent "unable to open database file" crash.
     if db_url.startswith("sqlite:////data/"):
         if not os.path.exists("/data"):
             app.logger.warning("Storage disk /data not found. Falling back to local sqlite.")
@@ -50,8 +49,6 @@ def create_app():
     # --- 4. EXTENSIONS ---
     db.init_app(app)
     csrf.init_app(app)
-    # Talisman handles SSL and security headers. 
-    # CSP is None to allow Tailwind scripts to run from the CDN.
     Talisman(app, content_security_policy=None)
 
     # --- 5. UI PERSISTENCE (Global Layout) ---
@@ -72,7 +69,7 @@ def create_app():
                     <div class="container mx-auto flex justify-between items-center">
                         <a href="/" class="text-2xl font-black text-blue-600">URL.CO</a>
                         <div class="space-x-4">
-                            <a href="/login" class="text-sm font-medium hover:text-blue-600">Log In</a>
+                            <a href="/login" class="text-sm hover:text-blue-600">Log In</a>
                             <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-bold hover:bg-blue-700 transition">Get Started</a>
                         </div>
                     </div>
@@ -92,7 +89,6 @@ def create_app():
     # --- 6. ROOT ROUTE ---
     @app.route('/')
     def index():
-        # Use the global render_layout tool defined in context_processor
         content = """
         <div class="text-center py-20">
             <h1 class="text-5xl font-extrabold mb-6 text-slate-800">Simplify your links.</h1>
@@ -103,28 +99,38 @@ def create_app():
             </div>
         </div>
         """
-        # Fetching the layout helper from the processor
         layout_func = utility_processor()['render_layout']
         return layout_func(content)
 
-    # --- 7. MODULAR ROUTE REGISTRATION ---
-    # The 404s on /login and /register mean these blocks are failing.
-    # Check your Render logs for "CRITICAL FAIL" to see the specific error.
+    # --- 7. DEBUG ROUTE (Helpful to see what is loaded) ---
+    @app.route('/debug-routes')
+    def list_routes():
+        import urllib
+        output = []
+        for rule in app.url_map.iter_rules():
+            methods = ','.join(rule.methods)
+            line = urllib.parse.unquote(f"{rule.endpoint:50s} {methods:20s} {rule}")
+            output.append(line)
+        return "<pre>" + "\n".join(output) + "</pre>"
+
+    # --- 8. MODULAR ROUTE REGISTRATION ---
+    # These blocks are likely failing due to syntax errors in auth.py and shortener.py.
+    # The traceback.format_exc() will print the EXACT line of the error to Render logs.
     try:
         from app_core.routes.auth import auth_bp
         app.register_blueprint(auth_bp)
-        app.logger.info("Successfully registered Auth Blueprint")
+        app.logger.info("SUCCESS: Auth Blueprint registered.")
     except Exception as e:
-        app.logger.error(f"CRITICAL FAIL: Auth Blueprint failed to load: {e}")
+        app.logger.error(f"CRITICAL FAIL: Auth Blueprint could not be registered.\n{traceback.format_exc()}")
 
     try:
         from app_core.routes.shortener import shortener_bp
         app.register_blueprint(shortener_bp)
-        app.logger.info("Successfully registered Shortener Blueprint")
+        app.logger.info("SUCCESS: Shortener Blueprint registered.")
     except Exception as e:
-        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint failed to load: {e}")
+        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint could not be registered.\n{traceback.format_exc()}")
 
-    # --- 8. DATABASE INITIALIZATION ---
+    # --- 9. DATABASE INITIALIZATION ---
     with app.app_context():
         try:
             db.create_all()
