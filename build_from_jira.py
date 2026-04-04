@@ -12,7 +12,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import BaseTool
-# Added Type for Pydantic schema validation
 from typing import List
 from pydantic import BaseModel, Field
 from jira import JIRA
@@ -25,7 +24,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
 TARGET_JIRA_TICKET = os.environ.get("TARGET_JIRA_TICKET")
-# FIX: Set PROJECT_ROOT to '.' to allow agents to specify full paths relative to the repo root.
+# Set PROJECT_ROOT to '.' to ensure paths like 'app_core/app.py' are handled relative to repo root
 PROJECT_ROOT = "."
 ENTRY_POINT = "app_core/app.py"
 LOG_DIR = "agent_logs"
@@ -74,7 +73,7 @@ def get_ticket_details_from_issue(jira_client, issue):
     return full_context
 
 def get_epic_children(jira_client, epic_id):
-    """Finds all child stories and filters by status."""
+    """Finds all child stories and filters by status, handling pagination."""
     try:
         issue = jira_client.issue(epic_id)
         if issue.fields.issuetype.name != 'Epic':
@@ -109,9 +108,8 @@ def transition_to_done(jira_client, issue):
 
 # --- 3. RETRIEVE EXISTING CODEBASE ---
 def get_existing_codebase():
-    """Aggregates all files in the app_core directory for AI context."""
+    """Aggregates all files in the repo for AI context."""
     code_map = ""
-    # We only care about the app_core folder for the coder's logic
     target_dir = Path("app_core")
     if not target_dir.exists():
         return "CODEBASE IS EMPTY."
@@ -170,31 +168,29 @@ class PythonTesterTool(BaseTool):
         
         files = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', codebase_payload, re.DOTALL)
         for f_path, content in files:
-            # FIX: Agents should return full paths starting with app_core/
             full_p = test_dir / f_path.strip()
             full_p.parent.mkdir(parents=True, exist_ok=True)
             with open(full_p, "w", encoding="utf-8") as f:
                 f.write(content.strip())
         
-        # FIX: Explicitly verify the structure mirrors Render
-        # Render expects: /app_core/app.py
-        # Start command: gunicorn app_core.app:app
+        # --- FIX 4: Improved WSGI Validation ---
         check_script = f"""
 import sys
 import os
-# Ensure the root of our temp dir is in the path
+from flask import Flask
 sys.path.insert(0, os.getcwd())
 try:
     from app_core.app import app
-    print("WSGI_CHECK_PASSED")
+    if isinstance(app, Flask):
+        print("WSGI_CHECK_PASSED")
+    else:
+        print(f"WSGI_CHECK_FAILED: 'app' is not a Flask instance, found {{type(app)}}")
+        sys.exit(1)
 except (ImportError, AttributeError) as e:
-    print(f"WSGI_CHECK_FAILED: Could not find 'app' object in 'app_core.app'. Error: {{e}}")
-    # Debug: list what we have
-    if os.path.exists('app_core'):
-        print(f"Files in app_core: {{os.listdir('app_core')}}")
+    print(f"WSGI_CHECK_FAILED: Gunicorn will fail to find 'app' in 'app_core.app'. Error: {{e}}")
     sys.exit(1)
 except Exception as e:
-    print(f"WSGI_CHECK_FAILED: {{e}}")
+    print(f"WSGI_CHECK_FAILED: Unexpected error: {{e}}")
     sys.exit(1)
 """
         check_file = test_dir / "wsgi_check.py"
@@ -202,10 +198,9 @@ except Exception as e:
             f.write(check_script)
 
         try:
-            # 1. WSGI Pre-flight Check (Runs from the root of temp_stability_test)
             result = subprocess.run([sys.executable, "wsgi_check.py"], capture_output=True, text=True, cwd=str(test_dir), timeout=15)
             if "WSGI_CHECK_PASSED" not in result.stdout:
-                return f"CRASH: Gunicorn validation failed.\nERROR: {result.stdout}\nSTDERR: {result.stderr}"
+                return f"CRASH: WSGI export validation failed.\nERROR: {result.stdout}\nSTDERR: {result.stderr}"
 
             return "SUCCESS"
         except subprocess.TimeoutExpired:
@@ -240,7 +235,8 @@ coder = Agent(
     role='Senior Python Developer',
     goal='Write clean, modular Flask code across multiple modules.',
     backstory="""You always return your work in '--- FILE: app_core/path/to/file.py ---' format. 
-    You must ensure that app_core/app.py exposes 'app' at the top level for Gunicorn.""",
+    CRITICAL: You must ensure that app_core/app.py explicitly instantiates 'app = create_app()' 
+    at the module level so Gunicorn can find it.""",
     llm=openai_llm,
     verbose=True
 )
@@ -249,8 +245,8 @@ qa_auditor = Agent(
     role='Modular Compliance Auditor',
     goal='Verify code passes local WSGI tests and generate finalized code blocks.',
     backstory="""You only care about results. You run the stability tester. 
-    You reject any code where the WSGI check fails. You ONLY return the verified 
-    code blocks in '--- FILE: path ---' format.""",
+    You reject any code where the 'app' export is missing from app_core/app.py. 
+    You ONLY return verified code blocks in '--- FILE: path ---' format.""",
     llm=openai_llm,
     verbose=True,
     tools=[python_tester_tool, online_validator_tool]
@@ -287,13 +283,15 @@ def run_build_cycle(issue, current_index, total_tickets):
 
     tasks = [
         Task(description=f"Create Technical Spec for: {jira_requirements}", agent=architect, expected_output="Technical spec."),
-        Task(description="Implement fixes. Output files using '--- FILE: app_core/path ---' format.", agent=coder, expected_output="Modified code blocks."),
+        # --- FIX 1: Explicit Coder Mandate ---
+        Task(description="Implement fixes. MANDATORY: 'app_core/app.py' MUST include 'app = create_app()' at the top level (not inside if __name__ == '__main__':). Output using '--- FILE: path ---' format.", agent=coder, expected_output="Modified code blocks."),
+        # --- FIX 2: Explicit QA Validation ---
         Task(
             description=(
                 "Use python_stability_tester to verify the code blocks. "
-                "Specifically ensure 'app' is exposed in 'app_core/app.py'. "
+                "Specifically ensure 'app' is exposed as a module-level variable in 'app_core/app.py'. "
                 "IF SUCCESS: Output the EXACT code blocks verified using the '--- FILE: path ---' format. "
-                "DO NOT provide bash scripts, instructions, or narrative. ONLY code blocks."
+                "DO NOT provide scripts or narrative. ONLY code blocks."
             ), 
             agent=qa_auditor, 
             expected_output="Finalized verified code blocks."
@@ -310,15 +308,22 @@ def run_build_cycle(issue, current_index, total_tickets):
 
     if files_found:
         for f_path, content in files_found:
-            # FIX: f_path now contains 'app_core/app.py', so we save directly to PROJECT_ROOT ('.')
             full_path = Path(PROJECT_ROOT) / f_path.strip()
             full_path.parent.mkdir(parents=True, exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 sanitized = re.sub(r'--- (?:FILE|END FILE):? .*? ---', '', content).strip()
                 f.write(sanitized)
+                
+            # --- FIX 3: Explicit Post-Save Validation ---
+            if "app_core/app.py" in str(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    file_body = f.read()
+                    if "app = create_app()" not in file_body:
+                        logger.error("🛑 CRITICAL: Saved app.py is missing 'app = create_app()'. Stopping push.")
+                        return False
         
         if deploy_to_github():
-            wait_time = 150 # Increased wait for Render
+            wait_time = 150 
             logger.info(f"⏱️ Waiting {wait_time}s for Render to finalize build...")
             time.sleep(wait_time)
             
@@ -334,7 +339,7 @@ def run_build_cycle(issue, current_index, total_tickets):
             
         return time.time() - start_time
     else:
-        logger.error(f"⛔ Agent failed to provide code blocks. Output was: {output_string[:200]}...")
+        logger.error(f"⛔ Agent failed to provide code blocks.")
         return False
 
 if __name__ == "__main__":
