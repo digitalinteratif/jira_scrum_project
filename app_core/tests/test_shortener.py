@@ -54,4 +54,4 @@ def test_find_unique_slug_with_reservation_and_collision(db_session, create_user
     row = db_session.query(models.ShortURL).filter_by(slug="unique42").first()
     assert row is not None
     assert row.slug == "unique42"
---- END FILE ---
+# --- END FILE ---

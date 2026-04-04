@@ -251,4 +251,4 @@ def password_policy_check(password: str, email: Optional[str] = None) -> List[st
 
 # Backwards-compatible alias
 password_policy_violations = password_policy_check
---- END FILE: utils/passwords.py ---
+# --- END FILE: utils/passwords.py ---

@@ -56,4 +56,4 @@ def test_revoke_token_and_is_revoked(db_session, create_user):
     # There should be at least one RevokedToken entry with this jti
     rv = db_session.query(models.RevokedToken).filter_by(jti=jti).first()
     assert rv is not None
---- END FILE ---
+# --- END FILE ---

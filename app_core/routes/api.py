@@ -451,9 +451,9 @@ def api_shorten():
         except Exception:
             pass
 
-Notes & guardrails
-- All database operations filter ownership by providing user_id from the API key (ID Filter rule).
-- No HTML responses are returned; JSON only.
-- CSRF is not required for JSON programmatic endpoints (API keys serve auth).
-- The decorator writes trace_KAN-145.txt entries for auth/limit/create events per Architectural Memory mandate.
---- END FILE ---
+# Notes & guardrails
+# - All database operations filter ownership by providing user_id from the API key (ID Filter rule).
+# - No HTML responses are returned; JSON only.
+# - CSRF is not required for JSON programmatic endpoints (API keys serve auth).
+# - The decorator writes trace_KAN-145.txt entries for auth/limit/create events per Architectural Memory mandate.
+# --- END FILE ---

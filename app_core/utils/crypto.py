@@ -189,4 +189,4 @@ def attach_jwt_cookie(response, token, cookie_name=None, max_age=None, path="/")
         # Do not propagate any exceptions from cookie-setting helper
         pass
     return response
---- END FILE: utils/crypto.py ---
+# --- END FILE: utils/crypto.py ---

@@ -33,4 +33,4 @@ app = create_app(test_config=prod_config)
 if __name__ == "__main__":
     # For manual testing: run Flask builtin (not used by CI)
     app.run(host="127.0.0.1", port=8000)
---- END FILE: wsgi/prod_wsgi.py ---
+# --- END FILE: wsgi/prod_wsgi.py ---

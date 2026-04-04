@@ -84,4 +84,4 @@ def test_shorten_form_and_copy_control():
     assert 'id="copy-shortlink"' in created_html
     assert 'aria-label="Copy short link"' in created_html or 'aria-label=\'Copy short link\'' in created_html
     assert 'tabindex="0"' in created_html or "tabindex=0" in created_html
---- END FILE: tests/test_accessibility.py ---
+# --- END FILE: tests/test_accessibility.py ---

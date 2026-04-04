@@ -453,4 +453,4 @@ def create_shorturl(session, user_id: int, target_url: str, slug: str, is_custom
 # Note: Avoid using session.query(ShortURL).get(id) for user-owned resources — that bypasses ownership checks.
 
 # End of models.py
---- END FILE ---
+# --- END FILE ---

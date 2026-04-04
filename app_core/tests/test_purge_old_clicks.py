@@ -78,4 +78,4 @@ def test_compute_cutoff():
     # cutoff should be roughly 90 days in the past (with small tolerance)
     delta = datetime.utcnow() - c
     assert abs(delta.days - 90) <= 1
---- END FILE: tests/test_purge_old_clicks.py ---
+# --- END FILE: tests/test_purge_old_clicks.py ---

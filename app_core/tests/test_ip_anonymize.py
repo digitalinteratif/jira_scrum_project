@@ -59,4 +59,4 @@ def test_ipv6_with_zone_stripping():
     assert masked is not None
     # Ensure it's a valid IPv6 string by parsing
     ipaddress.ip_address(masked)
---- END FILE: tests/test_ip_anonymize.py ---
+# --- END FILE: tests/test_ip_anonymize.py ---

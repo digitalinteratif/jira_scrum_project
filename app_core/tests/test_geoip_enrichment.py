@@ -76,4 +76,4 @@ def test_process_batch_integration(db_session, monkeypatch):
         os.remove("trace_KAN-147_test.txt")
     except Exception:
         pass
---- END FILE: tests/test_geoip_enrichment.py ---
+# --- END FILE: tests/test_geoip_enrichment.py ---

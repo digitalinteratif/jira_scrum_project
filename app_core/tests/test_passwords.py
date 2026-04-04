@@ -37,4 +37,4 @@ def test_policy_respects_min_length_config(app):
     finally:
         # cleanup is handled by test scope (app fixture recreated per test)
         pass
---- END FILE ---
+# --- END FILE ---

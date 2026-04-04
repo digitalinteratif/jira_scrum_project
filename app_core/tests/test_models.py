@@ -53,4 +53,4 @@ def test_user_shorturl_relationship_and_clickevent_roundtrip(db_session, create_
     # back relationship short.click_events should contain the click
     db_session.refresh(short)
     assert any(c.id == click.id for c in short.click_events)
---- END FILE ---
+# --- END FILE ---

@@ -170,4 +170,4 @@ def test_verify_rejects_private_ip_resolution(client, db_session, monkeypatch):
             s2.close()
         except Exception:
             pass
---- END FILE: tests/test_custom_domains.py ---
+# --- END FILE: tests/test_custom_domains.py ---

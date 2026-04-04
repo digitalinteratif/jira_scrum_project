@@ -153,4 +153,4 @@ def anonymize_ip(ip: str, ipv6_mask_lower_bits: Optional[int] = None) -> Optiona
     # Unhandled type: defensive
     _write_trace(f"ANON_UNHANDLED_TYPE ip={repr(candidate)} type={type(ip_obj)}")
     return None
---- END FILE: utils/ip.py ---
+# --- END FILE: utils/ip.py ---

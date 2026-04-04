@@ -86,4 +86,4 @@ def anonymize_ip(remote_addr: Optional[str] = None, x_forwarded_for: Optional[st
         pass
 
     return ""
---- END FILE: utils/security.py ---
+# --- END FILE: utils/security.py ---
