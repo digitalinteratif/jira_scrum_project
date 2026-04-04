@@ -1,5 +1,5 @@
 import os
-from flask import Flask, render_to_response, render_template_string
+from flask import Flask, render_template_string, render_template
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from flask_talisman import Talisman
@@ -24,7 +24,7 @@ csrf = CSRFProtect()
 def create_app():
     app = Flask(__name__)
 
-    # FIX: Using a single dictionary for config.update to prevent SyntaxError
+    # Configuration updated via dictionary to prevent SyntaxErrors
     app.config.update({
         "SECRET_KEY": os.environ.get("APP_SECRET", "dev-secret-key-12345"),
         "SQLALCHEMY_DATABASE_URI": os.environ.get("DATABASE_URL", "sqlite:///shortener.db"),
@@ -40,6 +40,7 @@ def create_app():
     csrf.init_app(app)
     
     # Security Headers (Enforces HTTPS on digitalinteractif.com)
+    # CSP is set to None for initial deployment compatibility with Tailwind CDN
     Talisman(app, content_security_policy=None) 
 
     # UI Persistence: Global Layout Wrapper
