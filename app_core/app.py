@@ -1,15 +1,16 @@
 import os
-from flask import Flask, render_template_string, render_template
+import logging
+from flask import Flask, render_template_string
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from flask_talisman import Talisman
 from dotenv import load_dotenv
 from sqlalchemy import MetaData
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
 
-# Centralized MetaData naming convention to prevent 'index already exists' errors
+# --- 1. DATABASE CONFIGURATION ---
 naming_convention = {
     "ix": 'ix_%(column_0_label)s',
     "uq": "uq_%(table_name)s_%(column_0_name)s",
@@ -22,12 +23,23 @@ db = SQLAlchemy(metadata=metadata)
 csrf = CSRFProtect()
 
 def create_app():
+    """Application Factory to initialize the modular service."""
     app = Flask(__name__)
 
-    # Configuration updated via dictionary to prevent SyntaxErrors
+    # --- 2. DATABASE PATH RESILIENCY ---
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///shortener.db")
+    
+    # If using the /data/ path but directory is missing (common on Render Free Tier), 
+    # fallback to root to prevent "unable to open database file" crash.
+    if db_url.startswith("sqlite:////data/"):
+        if not os.path.exists("/data"):
+            app.logger.warning("Storage disk /data not found. Falling back to local sqlite.")
+            db_url = "sqlite:///shortener.db"
+
+    # --- 3. CONFIGURATION ---
     app.config.update({
-        "SECRET_KEY": os.environ.get("APP_SECRET", "dev-secret-key-12345"),
-        "SQLALCHEMY_DATABASE_URI": os.environ.get("DATABASE_URL", "sqlite:///shortener.db"),
+        "SECRET_KEY": os.environ.get("APP_SECRET", "dev-secret-1234567890"),
+        "SQLALCHEMY_DATABASE_URI": db_url,
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
         "BASE_URL": os.environ.get("BASE_URL", "https://digitalinteractif.com"),
         "DATA_RETENTION_DAYS": int(os.environ.get("DATA_RETENTION_DAYS", 90)),
@@ -35,19 +47,15 @@ def create_app():
         "SESSION_COOKIE_SECURE": True if os.environ.get("BASE_URL") and "https" in os.environ.get("BASE_URL") else False,
     })
 
-    # Initialize extensions
+    # --- 4. EXTENSIONS ---
     db.init_app(app)
     csrf.init_app(app)
-    
-    # Security Headers (Enforces HTTPS on digitalinteractif.com)
-    # CSP is set to None for initial deployment compatibility with Tailwind CDN
-    Talisman(app, content_security_policy=None) 
+    Talisman(app, content_security_policy=None)
 
-    # UI Persistence: Global Layout Wrapper
+    # --- 5. UI PERSISTENCE (Global Layout) ---
     @app.context_processor
     def utility_processor():
         def render_layout(content_body):
-            """Wraps content strings into the consistent HTML5 boilerplate."""
             html_template = f"""
             <!DOCTYPE html>
             <html lang="en">
@@ -57,43 +65,47 @@ def create_app():
                 <title>URL Shortener | digitalinteractif.com</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class="bg-gray-50 text-gray-900 font-sans">
-                <nav class="bg-white border-b p-4 shadow-sm">
+            <body class="bg-slate-50 text-slate-900 font-sans">
+                <nav class="bg-white border-b border-slate-200 p-4 shadow-sm">
                     <div class="container mx-auto flex justify-between items-center">
-                        <a href="/" class="text-xl font-bold text-blue-600">URL Shortener</a>
-                        <div>
-                            <a href="/login" class="px-4 py-2 text-sm">Login</a>
-                            <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded text-sm">Sign Up</a>
+                        <a href="/" class="text-2xl font-black text-blue-600">URL.CO</a>
+                        <div class="space-x-4">
+                            <a href="/login" class="text-sm">Log In</a>
+                            <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-bold">Get Started</a>
                         </div>
                     </div>
                 </nav>
-                <main class="container mx-auto mt-10 p-4">
+                <main class="container mx-auto mt-12 px-4 max-w-5xl">
                     {content_body}
                 </main>
-                <footer class="mt-20 border-t p-10 text-center text-gray-500 text-sm">
-                    &copy; 2026 digitalinteractif.com - High-Performance Redirection
-                </footer>
             </body>
             </html>
             """
             return render_template_string(html_template)
         return dict(render_layout=render_layout)
 
-    # Register Blueprints (Modular Architecture)
+    # --- 6. MODULAR ROUTE REGISTRATION ---
     try:
         from app_core.routes.auth import auth_bp
-        from app_core.routes.shortener import shortener_bp
         app.register_blueprint(auth_bp)
-        app.register_blueprint(shortener_bp)
-    except ImportError as e:
-        app.logger.warning(f"Blueprint import failed: {e}")
+    except Exception as e:
+        app.logger.error(f"Auth Blueprint failed: {e}")
 
+    try:
+        from app_core.routes.shortener import shortener_bp
+        app.register_blueprint(shortener_bp)
+    except Exception as e:
+        app.logger.error(f"Shortener Blueprint failed: {e}")
+
+    # --- 7. DATABASE INITIALIZATION ---
     with app.app_context():
-        db.create_all()
+        try:
+            db.create_all()
+        except Exception as e:
+            app.logger.error(f"Database creation failed: {e}")
 
     return app
 
-# The Gunicorn entry point
 app = create_app()
 
 if __name__ == "__main__":
