@@ -694,4 +694,5 @@ def verify_email(token):
     session.commit()
 
     return render_layout("<h1>Account Verified</h1><p>Thank you. Your account is now active.</p>")
---- END FILE: routes/auth.py ---
+
+# End of routes/auth.py
