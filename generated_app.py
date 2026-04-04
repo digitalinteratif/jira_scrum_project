@@ -1,764 +1,1259 @@
-#!/usr/bin/env python3
-"""
-generated_app.py
+try:
+    from flask import (
+        Flask,
+        Blueprint,
+        render_template_string,
+        request,
+        redirect,
+        url_for,
+        jsonify,
+        current_app,
+        g,
+        make_response,
+    )
+except Exception as e:
+    raise ImportError("Flask is required. Install via `pip install Flask`") from e
 
-Single-file Flask application implementing a secure URL shortener per KAN-19 blueprint.
-All templates are inline and rendered via render_layout. Every HTML form includes CSRF.
-Uses:
- - Flask + Flask_SQLAlchemy
- - Flask-WTF CSRFProtect
- - argon2-cffi PasswordHasher
- - PyJWT for session and reset tokens
- - ThreadPoolExecutor for async click writes
-Environment variables required:
- - APP_SECRET
- - DATABASE_URL
- - BASE_URL
-Optional:
- - SHORT_CODE_LENGTH (default 6)
- - SHORT_CACHE_TTL (seconds, default 60)
- - ANON_CREATE_LIMIT (per window)
- - ANON_CREATE_WINDOW (seconds, default 3600)
- - PW_RESET_EXP (seconds, default 3600)
- - SESSION_EXP (seconds, default 8*3600)
- - REMEMBER_EXP (seconds, default 30*24*3600)
-"""
+# Optional CSRF protection wiring
+try:
+    from flask_wtf import CSRFProtect
+except Exception:
+    CSRFProtect = None  # handle gracefully; tests/dev may not have it
+
+try:
+    # generate_csrf is used to populate csrf_token() in templates
+    from flask_wtf.csrf import generate_csrf
+except Exception:
+    generate_csrf = None
+
+# SQLAlchemy imports (guarded)
+try:
+    from sqlalchemy import (
+        create_engine,
+        Column,
+        Integer,
+        String,
+        DateTime,
+        Boolean,
+        Text,
+        ForeignKey,
+        MetaData,
+    )
+    from sqlalchemy.orm import declarative_base, scoped_session, sessionmaker, relationship
+    from sqlalchemy.exc import IntegrityError
+except Exception:
+    # Surface a clear error later when DB is required; for now keep symbols as None/placeholders.
+    create_engine = None
+    Column = None
+    Integer = None
+    String = None
+    DateTime = None
+    Boolean = None
+    Text = None
+    ForeignKey = None
+    MetaData = None
+    declarative_base = None
+    scoped_session = None
+    sessionmaker = None
+    relationship = None
+    IntegrityError = Exception  # fallback
+
+# PyJWT import (guarded)
+try:
+    import jwt  # PyJWT
+    from jwt import ExpiredSignatureError, InvalidTokenError
+except Exception:
+    jwt = None
+    ExpiredSignatureError = Exception
+    InvalidTokenError = Exception
+
+# argon2 (guarded) for password hashing
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError as Argon2VerifyMismatchError
+except Exception:
+    PasswordHasher = None
+    Argon2VerifyMismatchError = Exception
 
 import os
-import re
-import base64
-import hmac
-import hashlib
+import logging
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from typing import Dict, Any
 import secrets
-import threading
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
 
-# dotenv is optional; support environments without python-dotenv
-try:
-    from dotenv import load_dotenv
-except Exception:
-    def load_dotenv(*args, **kwargs):
-        return None
+logger = logging.getLogger(__name__)
 
-from flask import (
-    Flask, request, redirect, abort, make_response, url_for,
-    render_template_string, jsonify
-)
-from flask_sqlalchemy import SQLAlchemy
-from flask_wtf import CSRFProtect
-from flask_wtf.csrf import generate_csrf
-from argon2 import PasswordHasher
-import jwt
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import Index
-
-# Load env
-load_dotenv()
-
-# Allow safe defaults for local/dev/testing if env vars are not set.
-APP_SECRET = os.getenv("APP_SECRET") or "dev_change_me"
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///data.db"
-BASE_URL = os.getenv("BASE_URL") or "http://localhost:5000"
-
-# Warn if using defaults (helps in testing environments)
-_using_defaults = []
-if os.getenv("APP_SECRET") is None:
-    _using_defaults.append("APP_SECRET")
-if os.getenv("DATABASE_URL") is None:
-    _using_defaults.append("DATABASE_URL")
-if os.getenv("BASE_URL") is None:
-    _using_defaults.append("BASE_URL")
-if _using_defaults:
-    print("Warning: using default environment values for: {}".format(", ".join(_using_defaults)))
-
-# Config defaults
-SHORT_CODE_LENGTH = int(os.getenv("SHORT_CODE_LENGTH", "6"))
-SHORT_CACHE_TTL = int(os.getenv("SHORT_CACHE_TTL", "60"))
-ANON_CREATE_LIMIT = int(os.getenv("ANON_CREATE_LIMIT", "10"))
-ANON_CREATE_WINDOW = int(os.getenv("ANON_CREATE_WINDOW", "3600"))
-PW_RESET_EXP = int(os.getenv("PW_RESET_EXP", "3600"))
-SESSION_EXP = int(os.getenv("SESSION_EXP", str(8 * 3600)))
-REMEMBER_EXP = int(os.getenv("REMEMBER_EXP", str(30 * 24 * 3600)))
-
-# Validate BASE_URL format
-if not BASE_URL.startswith("http://") and not BASE_URL.startswith("https://"):
-    raise RuntimeError("BASE_URL must include scheme (http:// or https://)")
-
-# Flask app
-app = Flask(__name__)
-app.config['SECRET_KEY'] = APP_SECRET
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-# CSRF timeout optional
-app.config['WTF_CSRF_TIME_LIMIT'] = None  # tokens valid until session cookie lifetime if desired
-
-# Cookie flags
-COOKIE_SECURE = True if BASE_URL.startswith("https://") else False
-COOKIE_SAMESITE = "Lax"
-AUTH_COOKIE_NAME = "auth_token"
-
-# Initialize extensions
-db = SQLAlchemy(app)
-csrf = CSRFProtect(app)
-ph = PasswordHasher()
-analytics_executor = ThreadPoolExecutor(max_workers=2)
-
-# ===========================
-# Models
-# ===========================
-
-class User(db.Model):
-    __tablename__ = 'user'
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), unique=True, index=True, nullable=False)
-    password_hash = db.Column(db.String(512), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    is_active = db.Column(db.Boolean, default=True)
-    last_login = db.Column(db.DateTime, nullable=True)
-
-    links = db.relationship('Link', backref='owner', lazy='dynamic')
-
-class Link(db.Model):
-    __tablename__ = 'link'
-    id = db.Column(db.Integer, primary_key=True)
-    short_code = db.Column(db.String(64), unique=True, index=True, nullable=False)
-    target_url = db.Column(db.Text, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    clicks_count = db.Column(db.Integer, default=0)
-    expires_at = db.Column(db.DateTime, nullable=True)
-    is_public = db.Column(db.Boolean, default=True)
-
-Index('ix_link_short_code', Link.short_code)
-Index('ix_link_user_id', Link.user_id)
-
-class Click(db.Model):
-    __tablename__ = 'click'
-    id = db.Column(db.Integer, primary_key=True)
-    link_id = db.Column(db.Integer, db.ForeignKey('link.id'), index=True, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    ip_hmac = db.Column(db.String(64))
-    user_agent = db.Column(db.String(512))
-    referrer = db.Column(db.String(1024))
-
-class RateLimit(db.Model):
-    __tablename__ = 'ratelimit'
-    id = db.Column(db.Integer, primary_key=True)
-    ip_hmac = db.Column(db.String(64), index=True)
-    action = db.Column(db.String(64))
-    window_start = db.Column(db.DateTime)
-    count = db.Column(db.Integer, default=0)
-
-# Initialize DB (simple create_all for single-file usage)
-with app.app_context():
-    db.create_all()
-
-# ===========================
-# Utilities
-# ===========================
-
-def make_ip_hmac(ip: str) -> str:
-    """
-    HMAC the IP address using APP_SECRET to anonymize it. Return URL-safe base64 truncated.
-    """
-    if not ip:
-        return ""
-    digest = hmac.new(APP_SECRET.encode('utf-8'), ip.encode('utf-8'), hashlib.sha256).digest()
-    b64 = base64.urlsafe_b64encode(digest).decode('utf-8')
-    return b64[:43]  # truncated for storage
-
-def is_valid_target_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
-    except Exception:
-        return False
-
-CUSTOM_CODE_RE = re.compile(r'^[A-Za-z0-9_-]{4,64}$')
-
-def generate_short_code(length: int = SHORT_CODE_LENGTH) -> str:
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
-
-# In-process cache for hot short codes
-_short_cache = {}
-_cache_lock = threading.Lock()
-
-def cache_get(code):
-    with _cache_lock:
-        entry = _short_cache.get(code)
-        if not entry:
-            return None
-        expires_at, data = entry
-        if datetime.utcnow() > expires_at:
-            del _short_cache[code]
-            return None
-        return data
-
-def cache_set(code, data, ttl=SHORT_CACHE_TTL):
-    with _cache_lock:
-        _short_cache[code] = (datetime.utcnow() + timedelta(seconds=ttl), data)
-
-# JWT helpers
-def create_jwt(payload: dict, exp_seconds: int) -> str:
-    now = datetime.utcnow()
-    payload_copy = payload.copy()
-    payload_copy.setdefault('iat', now)
-    payload_copy['exp'] = now + timedelta(seconds=exp_seconds)
-    token = jwt.encode(payload_copy, APP_SECRET, algorithm='HS256')
-    # PyJWT >=2 returns str
-    if isinstance(token, bytes):
-        token = token.decode('utf-8')
-    return token
-
-def decode_jwt(token: str):
-    try:
-        payload = jwt.decode(token, APP_SECRET, algorithms=['HS256'])
-        return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except Exception:
-        return None
-
-# Current user retrieval
-def get_current_user():
-    token = request.cookies.get(AUTH_COOKIE_NAME)
-    if not token:
-        return None
-    payload = decode_jwt(token)
-    if not payload:
-        return None
-    user_id = payload.get('user_id')
-    if not user_id:
-        return None
-    user = User.query.get(user_id)
-    return user
-
-def require_login():
-    user = get_current_user()
-    if not user:
-        # Redirect to login
-        return None
-    return user
-
-# render_layout helper
-def render_layout(title, body, **context):
-    base = """
-<!doctype html>
+# -------------------------
+# Template strings
+# -------------------------
+_layout_template = """<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{ title }}</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Smart Link - Dev</title>
   <style>
-    body { font-family: Arial, Helvetica, sans-serif; margin: 20px; }
-    nav { margin-bottom: 20px; }
-    form { margin: 10px 0; }
-    table { border-collapse: collapse; width: 100%; }
-    td, th { border: 1px solid #ddd; padding: 8px; }
-    th { background: #f4f4f4; }
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    nav { margin-bottom: 1rem; }
+    .container { max-width: 800px; margin: auto; }
+    .error { color: #a00; }
+    .success { color: #060; }
   </style>
 </head>
 <body>
-  <header>
-    <h1><a href="{{ base_url }}">Shortener</a></h1>
-  </header>
   <nav>
     <a href="/">Home</a> |
-    {% if current_user %}
-      <a href="/links">My Links</a> |
-      <form method="post" action="/logout" style="display:inline;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit">Logout</button>
-      </form>
-    {% else %}
-      <a href="/login">Login</a> |
-      <a href="/register">Register</a>
-    {% endif %}
+    <a href="/auth/">Auth</a> |
+    <a href="/s/">Shortener</a> |
+    <a href="/analytics/">Analytics</a>
   </nav>
-  <main>
-    {{ body|safe }}
-  </main>
+  <div class="container">
+    {{ body | safe }}
+  </div>
+  <footer style="margin-top: 2rem; font-size: .9rem; color: #666;">
+    Running in DEV mode. Do not use this secret in production.
+  </footer>
 </body>
 </html>
 """
-    ctx = dict(title=title, body=body, csrf_token=generate_csrf,
-               current_user=get_current_user(), base_url=BASE_URL)
-    ctx.update(context)
-    return render_template_string(base, **ctx)
 
-# ===========================
-# Analytics background writer
-# ===========================
+_auth_index_template = """<h1>Auth</h1>
+<p>
+  Use <a href="/auth/register">Register</a> to see a form sample with CSRF.
+</p>
 
-def _record_click_background(link_id, ip, user_agent, referrer, ts=None):
-    """
-    Runs in background thread; creates Click record.
-    """
-    with app.app_context():
-        try:
-            ip_h = make_ip_hmac(ip)
-            click = Click(
-                link_id=link_id,
-                timestamp=ts or datetime.utcnow(),
-                ip_hmac=ip_h,
-                user_agent=(user_agent or '')[:512],
-                referrer=(referrer or '')[:1024]
-            )
-            db.session.add(click)
-            db.session.commit()
-        except Exception as e:
-            # Log and continue; don't raise
-            app.logger.exception("Failed to record click: %s", e)
-            db.session.rollback()
+<!-- Logout form: included here to surface a safe, CSRF-protected POST to /auth/logout.
+     Forms must include the mandatory CSRF hidden input per the Epic. -->
+<form method="POST" action="/auth/logout" style="margin-top:1rem;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <button type="submit">Logout (invalidate token cookie)</button>
+</form>
+"""
 
-# ===========================
-# Rate limiting helpers
-# ===========================
+_auth_register_template = """<h2>Register (dev scaffold)</h2>
+<form method="POST" action="/auth/register">
+  <!-- MANDATORY CSRF token field as required by the Epic -->
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div>
+    <label>Email: <input name="email" type="email" required /></label>
+  </div>
+  <div>
+    <label>Password: <input name="password" type="password" required /></label>
+  </div>
+  <div>
+    <button type="submit">Register</button>
+  </div>
+</form>
+<p>Note: In this dev scaffold passwords may be hashed with argon2 if available.</p>
+"""
 
-def check_and_increment_anon_create(ip_h):
+_auth_register_success_template = """<h2 class="success">Registration Successful</h2>
+<p>User created with email: {{ email }}</p>
+<p><a href="/auth/">Back to Auth Index</a></p>
+"""
+
+_auth_register_error_template = """<h2 class="error">Registration Error</h2>
+<p class="error">{{ message }}</p>
+<form method="GET" action="/auth/register">
+  <button type="submit">Try Again</button>
+</form>
+"""
+
+_shorten_index_template = """<h2>Shorten a URL</h2>
+<form method="POST" action="/s/create">
+  <!-- MANDATORY CSRF token field as required by the Epic -->
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div>
+    <label>Target URL: <input name="target_url" type="url" placeholder="https://example.com" required /></label>
+  </div>
+  <div>
+    <button type="submit">Create Short Link</button>
+  </div>
+</form>
+"""
+
+_shorten_result_template = """<h2>Short Link Created (dev scaffold)</h2>
+<p>Target: {{ target }}</p>
+<p>(Creation omitted in scaffold)</p>
+"""
+
+_analytics_index_template = """<h2>Analytics</h2>
+<p>Minimal analytics scaffold.</p>
+"""
+
+# -------------------------
+# render_layout: UI Wrapper helper (no {% extends %} or {% block %})
+# -------------------------
+def render_layout(content_or_template_string, **context):
     """
-    Returns True if allowed, False if rate-limited. Also increments count when allowed.
+    If content_or_template_string looks like a template (contains templating markers or '<'),
+    we render it with the provided context and then inject the result into the global layout.
+    This avoids using Jinja2 {% extends %} or {% block %} constructs.
     """
-    now = datetime.utcnow()
-    window_start = now - timedelta(seconds=ANON_CREATE_WINDOW)
-    rl = RateLimit.query.filter_by(ip_hmac=ip_h, action='anon_create').first()
-    if rl and rl.window_start and rl.window_start > window_start:
-        if rl.count >= ANON_CREATE_LIMIT:
-            return False
-        rl.count += 1
-        db.session.commit()
-        return True
+    # Heuristic: if the string contains '<' or '{{' or '{%', treat it as a template to render
+    if isinstance(content_or_template_string, str) and (
+        "<" in content_or_template_string or "{{" in content_or_template_string or "{%" in content_or_template_string
+    ):
+        body_html = render_template_string(content_or_template_string, **context)
     else:
-        # reset/initialize
-        if not rl:
-            rl = RateLimit(ip_hmac=ip_h, action='anon_create', window_start=now, count=1)
-            db.session.add(rl)
-        else:
-            rl.window_start = now
-            rl.count = 1
-        db.session.commit()
-        return True
+        # Already rendered content passed in
+        body_html = content_or_template_string
+    return render_template_string(_layout_template, body=body_html)
 
-# ===========================
-# Routes
-# ===========================
 
-@app.route('/')
-def home():
-    body = """
-<h2>Shorten a URL</h2>
-<form method="post" action="/shorten">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>URL: <input name="target_url" type="url" required></label><br>
-  <label>Custom Code (optional): <input name="custom_code" type="text"></label><br>
-  <label>Expires at (optional): <input name="expires_at" type="datetime-local"></label><br>
-  <button type="submit">Shorten</button>
-</form>
-"""
-    return render_layout("Home", body)
+# -------------------------
+# models (surgical)
+# -------------------------
+# Ensure SQLAlchemy is available
+if declarative_base is None:
+    # Provide a clear ImportError to help developer
+    raise ImportError("SQLAlchemy is required. Install via `pip install SQLAlchemy`")
 
-@app.route('/shorten', methods=['POST'])
-def shorten():
-    target_url = (request.form.get('target_url') or '').strip()
-    custom_code = (request.form.get('custom_code') or '').strip()
-    expires_at_raw = request.form.get('expires_at')
+# Naming convention to ensure predictable constraint/index names across DBs.
+naming_convention = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+metadata = MetaData(naming_convention=naming_convention)
+Base = declarative_base(metadata=metadata)
 
-    if not target_url or not is_valid_target_url(target_url):
-        return render_layout("Error", "<p>Invalid target URL. Only http/https allowed.</p>"), 400
+# Module-level session factory (initialized by init_db)
+SessionLocal = None
+_engine = None
 
-    user = get_current_user()
-    ip = request.remote_addr or ''
-    ip_h = make_ip_hmac(ip)
 
-    # If anonymous, check rate-limit
-    if not user:
-        allowed = check_and_increment_anon_create(ip_h)
-        if not allowed:
-            return render_layout("Rate Limited", "<p>Anonymous create rate limit exceeded. Try later or create an account.</p>"), 429
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), nullable=False, unique=True)
+    password_hash = Column(Text, nullable=False)
+    failed_login_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
-    # parse expires_at
-    expires_at = None
-    if expires_at_raw:
-        try:
-            # browser sends datetime-local like "2023-03-31T12:34"
-            expires_at = datetime.fromisoformat(expires_at_raw)
-        except Exception:
-            expires_at = None
+    def __repr__(self):
+        return f"<User id={self.id} email={self.email}>"
 
-    # custom code validation
-    code = None
-    if custom_code:
-        if not CUSTOM_CODE_RE.match(custom_code):
-            return render_layout("Invalid Code", "<p>Custom code invalid. Use 4-64 chars [A-Za-z0-9_-].</p>"), 400
-        code = custom_code
 
-    # create unique short code, handle collisions
-    attempt = 0
-    while True:
-        attempt += 1
-        if not code:
-            code = generate_short_code()
-        link = Link(short_code=code, target_url=target_url, user_id=(user.id if user else None),
-                    expires_at=expires_at, is_public=True)
-        db.session.add(link)
-        try:
-            db.session.commit()
-            break
-        except IntegrityError:
-            db.session.rollback()
-            # collision -> regenerate code unless custom_code was provided
-            if custom_code:
-                return render_layout("Conflict", "<p>Custom code already in use. Choose another.</p>"), 409
-            code = None
-            if attempt > 5:
-                # fallback to longer random token
-                code = secrets.token_urlsafe(SHORT_CODE_LENGTH + 2)[:64]
-    # set cache
-    cache_set(code, {'target_url': target_url, 'link_id': link.id, 'expires_at': link.expires_at, 'is_public': link.is_public})
+class SessionToken(Base):
+    __tablename__ = "session_tokens"
+    id = Column(Integer, primary_key=True)
+    jti = Column(String(64), nullable=False, unique=True)
+    user_id = Column(Integer, ForeignKey("users.id", name="fk_session_tokens_user_id_users"), nullable=False)
+    issued_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked = Column(Boolean, nullable=False, default=False)
 
-    short_url = f"{BASE_URL.rstrip('/')}/{code}"
-    body = f"""
-<p>Short link created: <a href="{short_url}">{short_url}</a></p>
-<p><a href="/links">Manage your links</a></p>
-"""
-    return render_layout("Shortened", body)
+    user = relationship("User", backref="session_tokens")
 
-@app.route('/<string:short_code>')
-def redirect_short(short_code):
-    # check cache first
-    cached = cache_get(short_code)
-    link = None
-    if cached:
-        # validate expiry
-        expires_at = cached.get('expires_at')
-        if expires_at and expires_at < datetime.utcnow():
-            # expired
-            return render_layout("Expired", "<p>This link has expired.</p>"), 410
-        # no DB fetch necessary for public link
-        # but we need link id for analytics; cached contains link_id
-        target_url = cached.get('target_url')
-        link_id = cached.get('link_id')
-        is_public = cached.get('is_public')
-        link = Link.query.get(link_id) if link_id else None  # ensure object exists for checks
-    else:
-        link = Link.query.filter_by(short_code=short_code).first()
-        if not link:
-            return render_layout("Not found", "<p>Short link not found.</p>"), 404
-        # enforce expiry
-        if link.expires_at and link.expires_at < datetime.utcnow():
-            return render_layout("Expired", "<p>This link has expired.</p>"), 410
-        # cache
-        cache_set(short_code, {'target_url': link.target_url, 'link_id': link.id, 'expires_at': link.expires_at, 'is_public': link.is_public})
-        target_url = link.target_url
-        link_id = link.id
-        is_public = link.is_public
+    def __repr__(self):
+        return f"<SessionToken jti={self.jti} user_id={self.user_id} revoked={self.revoked}>"
 
-    # handle private links (if any)
-    if link and link.user_id and not link.is_public:
-        current = get_current_user()
-        if not current or current.id != link.user_id:
-            return render_layout("Forbidden", "<p>This link is private.</p>"), 403
 
-    # Quick atomic increment of clicks_count
+# New model: RevokedToken
+class RevokedToken(Base):
+    """
+    Tracks revoked JWT identifiers (jti). This table is intended to be queried by
+    jwt_utils.is_revoked to determine whether a presented token must be rejected.
+    Fields:
+      - jti (PK): token identifier
+      - revoked_at: when we recorded the revocation
+      - expires_at: original token expiry (optional, used for cleanup or short-circuit)
+    """
+    __tablename__ = "revoked_tokens"
+    jti = Column(String(64), primary_key=True)
+    revoked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<RevokedToken jti={self.jti} revoked_at={self.revoked_at} expires_at={self.expires_at}>"
+
+
+def init_db(app):
+    """
+    Initialize DB engine and scoped session.
+
+    - app.config['DATABASE_URL'] is required.
+    - Creates tables if they do not exist (lenient; dev convenience).
+    """
+    global SessionLocal, _engine
+    database_url = app.config.get("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL not set in app.config")
+
+    _engine = create_engine(database_url, future=True, echo=app.config.get("SQL_ECHO", False))
+    SessionLocal = scoped_session(sessionmaker(bind=_engine, autoflush=False, autocommit=False))
+
     try:
-        db.session.query(Link).filter_by(id=link_id).update({"clicks_count": Link.clicks_count + 1})
-        db.session.commit()
+        Base.metadata.create_all(_engine)
     except Exception:
-        db.session.rollback()
-
-    # enqueue click record
-    ip = request.remote_addr or ''
-    ua = request.headers.get('User-Agent', '')
-    ref = request.headers.get('Referer', '')
-    try:
-        analytics_executor.submit(_record_click_background, link_id, ip, ua, ref, datetime.utcnow())
-    except Exception:
-        app.logger.exception("Failed to enqueue analytics task")
-
-    # Redirect
-    resp = redirect(target_url, code=302)
-    return resp
-
-# ---------------------------
-# Authentication
-# ---------------------------
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'GET':
-        body = """
-<h2>Register</h2>
-<form method="post" action="/register">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>Email: <input name="email" type="email" required></label><br>
-  <label>Password: <input name="password" type="password" required></label><br>
-  <button type="submit">Register</button>
-</form>
-"""
-        return render_layout("Register", body)
-    # POST
-    email = (request.form.get('email') or '').strip().lower()
-    password = request.form.get('password') or ''
-    if not email or not password:
-        return render_layout("Error", "<p>Missing email or password.</p>"), 400
-    if User.query.filter_by(email=email).first():
-        return render_layout("Exists", "<p>User already exists.</p>"), 409
-    pw_hash = ph.hash(password)
-    user = User(email=email, password_hash=pw_hash)
-    db.session.add(user)
-    db.session.commit()
-    # Auto-login after register
-    token = create_jwt({'user_id': user.id}, SESSION_EXP)
-    resp = make_response(render_layout("Registered", "<p>Registered successfully. <a href='/links'>Go to links</a></p>"))
-    resp.set_cookie(AUTH_COOKIE_NAME, token, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, path='/')
-    return resp
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'GET':
-        body = """
-<h2>Login</h2>
-<form method="post" action="/login">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>Email: <input name="email" type="email" required></label><br>
-  <label>Password: <input name="password" type="password" required></label><br>
-  <label><input name="remember" type="checkbox"> Remember me</label><br>
-  <button type="submit">Login</button>
-</form>
-<p><a href="/reset-password">Forgot password?</a></p>
-"""
-        return render_layout("Login", body)
-    email = (request.form.get('email') or '').strip().lower()
-    password = request.form.get('password') or ''
-    remember = bool(request.form.get('remember'))
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return render_layout("Login Failed", "<p>Invalid credentials.</p>"), 401
-    try:
-        if not ph.verify(user.password_hash, password):
-            return render_layout("Login Failed", "<p>Invalid credentials.</p>"), 401
-    except Exception:
-        return render_layout("Login Failed", "<p>Invalid credentials.</p>"), 401
-    # Optional rehash check
-    try:
-        if ph.check_needs_rehash(user.password_hash):
-            user.password_hash = ph.hash(password)
-            db.session.commit()
-    except Exception:
+        # Do not crash startup; tests and health endpoint can surface issues.
         pass
-    user.last_login = datetime.utcnow()
-    db.session.commit()
-    exp = REMEMBER_EXP if remember else SESSION_EXP
-    token = create_jwt({'user_id': user.id}, exp)
-    resp = make_response(redirect('/links'))
-    resp.set_cookie(AUTH_COOKIE_NAME, token, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, path='/')
-    return resp
 
-@app.route('/logout', methods=['POST'])
-def logout():
-    # CSRF protects this route
-    resp = make_response(redirect('/'))
-    resp.set_cookie(AUTH_COOKIE_NAME, '', expires=0, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, path='/')
-    return resp
 
-# ---------------------------
-# Password reset
-# ---------------------------
+def get_session():
+    global SessionLocal
+    if SessionLocal is None:
+        raise RuntimeError("Database not initialized. Call init_db(app) first.")
+    return SessionLocal()
 
-@app.route('/reset-password', methods=['GET', 'POST'])
-def reset_request():
-    if request.method == 'GET':
-        body = """
-<h2>Password reset</h2>
-<form method="post" action="/reset-password">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>Email: <input name="email" type="email" required></label><br>
-  <button type="submit">Send Reset Link</button>
-</form>
-"""
-        return render_layout("Reset Password", body)
-    email = (request.form.get('email') or '').strip().lower()
-    user = User.query.filter_by(email=email).first()
-    # Always render success message to avoid user enumeration
-    if user:
-        token = create_jwt({'user_id': user.id, 'purpose': 'pw_reset'}, PW_RESET_EXP)
-        reset_link = f"{BASE_URL.rstrip('/')}/reset/{token}"
-        # In real deployment, send email. For this single-file app, we'll show link in response (not secure for public).
-        app.logger.info("Password reset requested for %s; reset link: %s", email, reset_link)
-        # NOTE: we intentionally do not send email here.
-    body = "<p>If the email exists, a reset link has been sent.</p>"
-    return render_layout("Reset Requested", body)
 
-@app.route('/reset/<string:token>', methods=['GET', 'POST'])
-def reset_perform(token):
-    payload = decode_jwt(token)
-    if not payload or payload.get('purpose') != 'pw_reset':
-        return render_layout("Invalid or expired", "<p>Reset token invalid or expired.</p>"), 400
-    user_id = payload.get('user_id')
-    user = User.query.get(user_id)
-    if not user:
-        return render_layout("Invalid", "<p>User not found.</p>"), 400
-    if request.method == 'GET':
-        body = f"""
-<h2>Reset password for {user.email}</h2>
-<form method="post" action="/reset/{token}">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>New password: <input name="password" type="password" required></label><br>
-  <button type="submit">Set password</button>
-</form>
-"""
-        return render_layout("Reset Password", body)
-    # POST - update password
-    new_pw = request.form.get('password') or ''
-    if not new_pw:
-        return render_layout("Error", "<p>Password required.</p>"), 400
-    user.password_hash = ph.hash(new_pw)
-    db.session.commit()
-    return render_layout("Password reset", "<p>Password updated. <a href='/login'>Login</a></p>")
+def create_user(email: str, password: str, session=None) -> User:
+    # Lazy import of password utils
+    close_session = False
+    if session is None:
+        session = get_session()
+        close_session = True
 
-# ---------------------------
-# Link management (user-only)
-# ---------------------------
+    try:
+        pwd_hash = password
+        if PasswordHasher is not None:
+            try:
+                ph = PasswordHasher()
+                pwd_hash = ph.hash(password)
+            except Exception:
+                # fallback to raw (dev only)
+                pwd_hash = password
 
-@app.route('/links')
-def links_list():
-    user = require_login()
-    if not user:
-        return redirect('/login')
-    links = Link.query.filter_by(user_id=user.id).order_by(Link.created_at.desc()).all()
-    rows = ""
-    for l in links:
-        short = f"{BASE_URL.rstrip('/')}/{l.short_code}"
-        rows += f"<tr><td>{l.short_code}</td><td><a href='{short}' target='_blank'>{short}</a></td><td>{l.target_url}</td><td>{l.clicks_count}</td>"
-        rows += f"<td><a href='/links/{l.id}/edit'>Edit</a> | "
-        rows += f"<form method='post' action='/links/{l.id}/delete' style='display:inline;'>"
-        rows += "<input type='hidden' name='csrf_token' value='{{ csrf_token() }}'>"
-        rows += "<button type='submit'>Delete</button></form></td></tr>"
-    body = f"""
-<h2>My Links</h2>
-<p><a href="/">Create new link</a></p>
-<table>
-<tr><th>Code</th><th>Short URL</th><th>Target</th><th>Clicks</th><th>Actions</th></tr>
-{rows}
-</table>
-"""
-    return render_layout("My Links", body)
+        user = User(email=email, password_hash=pwd_hash, created_at=datetime.utcnow())
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        if close_session:
+            try:
+                session.close()
+            except Exception:
+                pass
 
-@app.route('/links/<int:link_id>/edit', methods=['GET', 'POST'])
-def edit_link(link_id):
-    user = require_login()
-    if not user:
-        return redirect('/login')
-    link = Link.query.filter_by(id=link_id, user_id=user.id).first_or_404()
-    if request.method == 'GET':
-        expires_value = link.expires_at.isoformat() if link.expires_at else ''
-        body = f"""
-<h2>Edit Link</h2>
-<form method="post" action="/links/{link_id}/edit">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <label>Target URL: <input name="target_url" type="url" value="{link.target_url}" required></label><br>
-  <label>Expires at: <input name="expires_at" type="datetime-local" value="{expires_value}"></label><br>
-  <label>Public: <input name="is_public" type="checkbox" {"checked" if link.is_public else ""}></label><br>
-  <button type="submit">Save</button>
-</form>
-"""
-        return render_layout("Edit Link", body)
-    # POST
-    target_url = (request.form.get('target_url') or '').strip()
-    expires_at_raw = request.form.get('expires_at')
-    is_public = bool(request.form.get('is_public'))
-    if not is_valid_target_url(target_url):
-        return render_layout("Error", "<p>Invalid URL.</p>"), 400
-    expires_at = None
-    if expires_at_raw:
+
+# -------------------------
+# utils.passwords (small wrapper)
+# -------------------------
+class passwords:
+    """
+    Lightweight password utilities. Uses argon2 if available, otherwise falls back
+    to a dev-only compare_digest approach (not secure).
+    """
+
+    @staticmethod
+    def hash_password(plain: str) -> str:
+        if PasswordHasher is not None:
+            ph = PasswordHasher()
+            return ph.hash(plain)
+        # dev fallback (insecure): return plain
+        return plain
+
+    @staticmethod
+    def verify_password(stored_hash: str, plain: str) -> bool:
+        if PasswordHasher is not None:
+            ph = PasswordHasher()
+            try:
+                return ph.verify(stored_hash, plain)
+            except Argon2VerifyMismatchError:
+                return False
+            except Exception:
+                # On unexpected errors, be conservative and return False
+                return False
+        # dev fallback: constant-time compare
         try:
-            expires_at = datetime.fromisoformat(expires_at_raw)
+            return secrets.compare_digest(stored_hash, plain)
         except Exception:
-            expires_at = None
-    link.target_url = target_url
-    link.expires_at = expires_at
-    link.is_public = is_public
-    db.session.commit()
-    # update cache
-    cache_set(link.short_code, {'target_url': link.target_url, 'link_id': link.id, 'expires_at': link.expires_at, 'is_public': link.is_public})
-    return redirect('/links')
+            return False
 
-@app.route('/links/<int:link_id>/delete', methods=['POST'])
-def delete_link(link_id):
-    user = require_login()
-    if not user:
-        return redirect('/login')
-    link = Link.query.filter_by(id=link_id, user_id=user.id).first_or_404()
-    db.session.delete(link)
-    db.session.commit()
-    # remove from cache if present
-    with _cache_lock:
-        if link.short_code in _short_cache:
-            del _short_cache[link.short_code]
-    return redirect('/links')
 
-# ---------------------------
-# Analytics view
-# ---------------------------
+# -------------------------
+# utils.jwt (surgical)
+# -------------------------
+class jwt_utils:
+    """
+    JWT helper utilities.
+    """
 
-@app.route('/analytics/<int:link_id>')
-def analytics_view(link_id):
-    user = require_login()
-    if not user:
-        return redirect('/login')
-    # enforce ID Filter Rule
-    link = Link.query.filter_by(id=link_id, user_id=user.id).first_or_404()
-    total_clicks = link.clicks_count
-    # recent clicks (last 50)
-    clicks = Click.query.filter_by(link_id=link.id).order_by(Click.timestamp.desc()).limit(50).all()
-    rows = ""
-    for c in clicks:
-        rows += f"<tr><td>{c.timestamp}</td><td>{c.ip_hmac}</td><td>{c.user_agent}</td><td>{c.referrer}</td></tr>"
-    body = f"""
-<h2>Analytics for {link.short_code}</h2>
-<p>Total clicks (cached): {total_clicks}</p>
-<table>
-<tr><th>When</th><th>IP HMAC</th><th>User Agent</th><th>Referrer</th></tr>
-{rows}
-</table>
+    @staticmethod
+    def _get_secret_key():
+        return current_app.config.get("SECRET_KEY", "dev-secret-key")
+
+    @staticmethod
+    def _get_jwt_settings():
+        return {
+            "exp_seconds": int(current_app.config.get("JWT_EXP_SECONDS", 3600)),
+            "cookie_name": current_app.config.get("JWT_COOKIE_NAME", "access_token"),
+            "algorithm": current_app.config.get("JWT_ALGORITHM", "HS256"),
+        }
+
+    @staticmethod
+    def create_access_token(user_id: int, jti: str, purpose: str = None, exp_seconds: int = None) -> str:
+        """
+        Create a JWT access token for a given user_id and jti.
+
+        Optional:
+         - purpose: a short string indicating intended use (e.g., 'password_reset')
+         - exp_seconds: override default expiry seconds from config
+
+        The token payload will include:
+          - user_id (int)
+          - jti (str)
+          - iat (int timestamp)
+          - exp (int timestamp)
+          - purpose (if provided)
+
+        Uses current_app config via jwt_utils._get_jwt_settings and _get_secret_key.
+        """
+        if jwt is None:
+            raise RuntimeError("PyJWT is required for JWT operations. Install via `pip install PyJWT`")
+        settings = jwt_utils._get_jwt_settings()
+        now = datetime.now(tz=timezone.utc)
+        # Choose expiry: explicit override beats configured value
+        if exp_seconds is None:
+            exp_seconds = int(current_app.config.get("JWT_EXP_SECONDS", settings.get("exp_seconds", 3600)))
+        exp = now + timedelta(seconds=int(exp_seconds))
+        payload = {
+            "user_id": int(user_id),
+            "jti": str(jti),
+            "exp": int(exp.timestamp()),
+            "iat": int(now.timestamp()),
+        }
+        if purpose:
+            payload["purpose"] = str(purpose)
+        token = jwt.encode(payload, jwt_utils._get_secret_key(), algorithm=settings["algorithm"])
+        # PyJWT v2 returns str
+        return token
+
+    @staticmethod
+    def decode_token(token: str) -> Dict[str, Any]:
+        """
+        Decode a token and return its payload as a dict. No additional validation beyond
+        PyJWT verification (signature and expiry) is performed here; callers should
+        check 'purpose' and other app-level semantics as needed.
+        """
+        if jwt is None:
+            raise RuntimeError("PyJWT is required for JWT operations. Install via `pip install PyJWT`")
+        settings = jwt_utils._get_jwt_settings()
+        payload = jwt.decode(token, jwt_utils._get_secret_key(), algorithms=[settings["algorithm"]])
+        # Normalize types where convenient
+        if "user_id" in payload:
+            try:
+                payload["user_id"] = int(payload.get("user_id"))
+            except Exception:
+                # Keep original if cast fails; callers must validate
+                pass
+        return payload
+
+    @staticmethod
+    def is_revoked(jti: str) -> bool:
+        """
+        Determine whether a token (by jti) must be rejected.
+
+        Order:
+         - If jti exists in RevokedToken and not yet expired (or expired), consider revoked.
+         - Else fall back to SessionToken table (existing behavior) to consider revoked/expired.
+         - Any unexpected error returns True (fail-closed).
+        """
+        sess = None
+        try:
+            sess = get_session()
+            # First consult revoked_tokens table
+            rt = sess.query(RevokedToken).filter(RevokedToken.jti == jti).first()
+            now = datetime.now(tz=timezone.utc)
+            if rt:
+                # If we have a RevokedToken record, treat it as revoked regardless of expires_at.
+                # But for completeness, if the revoked record has an expires_at and it's in the past,
+                # we still consider the token revoked (revocation is authoritative).
+                return True
+
+            # Fall back to older SessionToken semantics if no explicit RevokedToken exists
+            st = sess.query(SessionToken).filter(SessionToken.jti == jti).first()
+            if not st:
+                # If we don't know about this session token, treat it as revoked (unknown/jti not issued)
+                return True
+            if st.revoked:
+                return True
+            exp = st.expires_at
+            if exp is not None:
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if exp <= now:
+                    return True
+            return False
+        except Exception as e:
+            logger.exception("Error checking is_revoked for jti=%s: %s", jti, e)
+            # Fail-closed: on DB errors or other exceptions, treat as revoked
+            return True
+        finally:
+            if sess:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def jwt_required(fn):
+        def wrapper(*args, **kwargs):
+            settings = jwt_utils._get_jwt_settings()
+            cookie_name = settings["cookie_name"]
+            token = None
+
+            if request.cookies:
+                token = request.cookies.get(cookie_name)
+
+            if not token:
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header.startswith("Bearer "):
+                    token = auth_header.split(" ", 1)[1].strip()
+
+            if not token:
+                return jsonify({"error": "missing_token"}), 401
+
+            try:
+                payload = jwt_utils.decode_token(token)
+            except ExpiredSignatureError:
+                return jsonify({"error": "token_expired"}), 401
+            except InvalidTokenError:
+                return jsonify({"error": "invalid_token"}), 401
+            except Exception:
+                return jsonify({"error": "token_decode_error"}), 401
+
+            jti = payload.get("jti")
+            user_id = payload.get("user_id")
+            if not jti or not user_id:
+                return jsonify({"error": "invalid_token_claims"}), 401
+
+            try:
+                if jwt_utils.is_revoked(jti):
+                    return jsonify({"error": "token_revoked"}), 401
+            except Exception:
+                return jsonify({"error": "token_revoked_check_failed"}), 401
+
+            sess = None
+            try:
+                sess = get_session()
+                user = sess.query(User).filter(User.id == int(user_id)).first()
+                if not user:
+                    return jsonify({"error": "user_not_found"}), 401
+                g.current_user = user
+                return fn(*args, **kwargs)
+            finally:
+                if sess:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+
+        # Preserve wrapper attributes
+        import functools
+        return functools.wraps(fn)(wrapper)
+
+
+# -------------------------
+# Blueprints: auth, shortener, analytics
+# -------------------------
+auth_bp = Blueprint("auth", __name__)
+shortener_bp = Blueprint("shortener", __name__)
+analytics_bp = Blueprint("analytics", __name__)
+
+# Auth templates (all include CSRF hidden input)
+_login_template = """<h2>Login</h2>
+<form method="POST" action="/auth/login">
+  <!-- MANDATORY CSRF token field as required by the Epic -->
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div>
+    <label>Email: <input name="email" type="email" required /></label>
+  </div>
+  <div>
+    <label>Password: <input name="password" type="password" required /></label>
+  </div>
+  <div>
+    <button type="submit">Sign In</button>
+  </div>
+</form>
+<p><a href="/auth/register">Register</a></p>
 """
-    return render_layout("Analytics", body)
 
-# ---------------------------
-# Health and debug
-# ---------------------------
+_login_error_template = """<h2 class="error">Login Failed</h2>
+<p class="error">{{ message }}</p>
+<form method="GET" action="/auth/login">
+  <button type="submit">Try Again</button>
+</form>
+"""
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+_login_success_template = """<h2 class="success">Login Successful</h2>
+<p>Welcome back, {{ email }}. You should be redirected.</p>
+<p><a href="/">Go Home</a></p>
+"""
 
-# ===========================
-# Error handlers
-# ===========================
+_register_get_template = _auth_register_template
 
-@app.errorhandler(400)
-def bad_request(e):
-    return render_layout("Bad Request", "<p>Bad request (CSRF token missing or invalid).</p>"), 400
+_register_success_template = _auth_register_success_template
+_register_error_template = _auth_register_error_template
 
-@app.errorhandler(404)
-def not_found(e):
-    return render_layout("Not Found", "<p>Page not found.</p>"), 404
 
-@app.errorhandler(403)
-def forbidden(e):
-    return render_layout("Forbidden", "<p>Forbidden.</p>"), 403
+@auth_bp.route("/", methods=["GET"])
+def auth_index():
+    return render_layout(_auth_index_template)
 
-@app.errorhandler(500)
-def server_error(e):
-    return render_layout("Server Error", "<p>Internal server error.</p>"), 500
 
-# ===========================
-# Run
-# ===========================
-if __name__ == '__main__':
-    # For local dev only; production should use Gunicorn
-    debug = os.getenv("FLASK_DEBUG", "0") == "1"
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", "5000")), debug=debug)
+@auth_bp.route("/register", methods=["GET"])
+def register_get():
+    return render_layout(_register_get_template)
+
+
+@auth_bp.route("/register", methods=["POST"])
+def register_post():
+    form = request.form or {}
+    email = (form.get("email") or "").strip()
+    password = form.get("password") or ""
+
+    if not email or not password:
+        return render_layout(_register_error_template, message="Email and password required"), 400
+
+    sess = None
+    try:
+        sess = get_session()
+        try:
+            # Use create_user helper (which uses hashing if available)
+            user = create_user(email=email, password=password, session=sess)
+            return render_layout(_register_success_template, email=user.email)
+        except IntegrityError:
+            sess.rollback()
+            return render_layout(_register_error_template, message="Email already registered"), 400
+        except Exception as e:
+            sess.rollback()
+            current_app.logger.exception("Registration error: %s", e)
+            return render_layout(_register_error_template, message="Internal error"), 500
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+
+@auth_bp.route("/login", methods=["GET"])
+def login_get():
+    return render_layout(_login_template)
+
+
+@auth_bp.route("/login", methods=["POST"])
+def login_post():
+    form = request.form or {}
+    email = (form.get("email") or "").strip()
+    password = form.get("password") or ""
+
+    if not email or not password:
+        return render_layout(_login_error_template, message="Email and password are required"), 400
+
+    sess = None
+    try:
+        sess = get_session()
+        user = sess.query(User).filter(User.email == email).first()
+
+        password_ok = False
+        if user:
+            try:
+                password_ok = passwords.verify_password(user.password_hash, password)
+            except Exception:
+                password_ok = False
+        else:
+            # Timing equalizer to avoid user enumeration
+            try:
+                if PasswordHasher is not None:
+                    ph = PasswordHasher()
+                    dummy_hash = ph.hash("dummy-password")
+                    try:
+                        ph.verify(dummy_hash, password)
+                    except Exception:
+                        pass
+                else:
+                    secrets.compare_digest("dummy", password[:5])
+            except Exception:
+                pass
+
+        if not password_ok:
+            if user:
+                try:
+                    user.failed_login_count = (user.failed_login_count or 0) + 1
+                    sess.add(user)
+                    sess.commit()
+                except Exception:
+                    sess.rollback()
+            return render_layout(_login_error_template, message="Invalid credentials"), 401
+
+        # success path
+        try:
+            user.failed_login_count = 0
+            sess.add(user)
+
+            jti = str(uuid4())
+            token = jwt_utils.create_access_token(user_id=user.id, jti=jti)
+
+            payload = jwt_utils.decode_token(token)
+            exp_ts = int(payload.get("exp"))
+            expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+
+            st = SessionToken(
+                jti=jti,
+                user_id=user.id,
+                issued_at=datetime.now(tz=timezone.utc),
+                expires_at=expires_at,
+                revoked=False,
+            )
+            sess.add(st)
+            sess.commit()
+        except Exception as e:
+            sess.rollback()
+            current_app.logger.exception("Error creating session token: %s", e)
+            return render_layout(_login_error_template, message="Internal error during login"), 500
+
+        cookie_name = current_app.config.get("JWT_COOKIE_NAME", "access_token")
+        cookie_secure = bool(current_app.config.get("SESSION_COOKIE_SECURE", current_app.config.get("JWT_COOKIE_SECURE", False)))
+        cookie_httponly = bool(current_app.config.get("SESSION_COOKIE_HTTPONLY", True))
+        cookie_samesite = current_app.config.get("SESSION_COOKIE_SAMESITE", current_app.config.get("JWT_COOKIE_SAMESITE", "Lax"))
+
+        resp = make_response(redirect(url_for("index")))
+        resp.set_cookie(
+            cookie_name,
+            token,
+            httponly=cookie_httponly,
+            secure=cookie_secure,
+            samesite=cookie_samesite,
+            path="/",
+            expires=expires_at,
+        )
+        return resp
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+
+# New endpoint: POST /auth/logout
+@auth_bp.route("/logout", methods=["POST"])
+def logout_post():
+    """
+    POST /auth/logout
+    - Reads token from cookie (or Authorization header fallback)
+    - Attempts to decode (if expired, decodes without verifying exp to extract jti and exp)
+    - Inserts RevokedToken record with jti and original expires_at (idempotent)
+    - Clears the cookie (set empty value and immediate expiry)
+    - Returns a redirect to auth index (or JSON if prefered)
+    """
+    settings = jwt_utils._get_jwt_settings()
+    cookie_name = settings["cookie_name"]
+
+    token = None
+    if request.cookies:
+        token = request.cookies.get(cookie_name)
+
+    if not token:
+        # Try Authorization header fallback
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+
+    # Prepare cookie clearing response regardless of token validity
+    cookie_secure = bool(current_app.config.get("SESSION_COOKIE_SECURE", current_app.config.get("JWT_COOKIE_SECURE", False)))
+    cookie_httponly = bool(current_app.config.get("SESSION_COOKIE_HTTPONLY", True))
+    cookie_samesite = current_app.config.get("SESSION_COOKIE_SAMESITE", current_app.config.get("JWT_COOKIE_SAMESITE", "Lax"))
+
+    # Default response: redirect back to auth index
+    resp = make_response(redirect(url_for("auth.auth_index")))
+
+    # Clear cookie in any case (idempotent)
+    try:
+        resp.set_cookie(cookie_name, "", httponly=cookie_httponly, secure=cookie_secure, samesite=cookie_samesite, path="/", expires=0)
+    except Exception:
+        # set_cookie may raise in odd environments; ignore to ensure logout flow continues
+        pass
+
+    if not token:
+        # No token presented; logout is effectively a cookie clear -> return success
+        return resp
+
+    # Try to extract jti and exp. If token is expired, decode without expiry verification to obtain jti and exp for revocation record
+    if jwt is None:
+        # PyJWT not available; we cannot decode token to record jti. Still clear cookie and return success.
+        return resp
+
+    jti = None
+    exp_ts = None
+    try:
+        # First, try the normal strict decode (which will raise on expired)
+        payload = jwt_utils.decode_token(token)
+        jti = payload.get("jti")
+        exp_value = payload.get("exp")
+        if exp_value:
+            try:
+                exp_ts = int(exp_value)
+            except Exception:
+                exp_ts = None
+    except ExpiredSignatureError:
+        # Token expired: decode without verifying expiration to obtain jti/exp for revocation record
+        try:
+            settings = jwt_utils._get_jwt_settings()
+            payload = jwt.decode(token, jwt_utils._get_secret_key(), algorithms=[settings["algorithm"]], options={"verify_exp": False})
+            jti = payload.get("jti")
+            exp_value = payload.get("exp")
+            if exp_value:
+                try:
+                    exp_ts = int(exp_value)
+                except Exception:
+                    exp_ts = None
+        except Exception:
+            # Malformed token: nothing to revoke; treat logout as successful cookie clear
+            return resp
+    except InvalidTokenError:
+        # Invalid token: nothing to revoke
+        return resp
+    except Exception:
+        # Other decode errors: log for debugging and treat as success (cookie cleared)
+        current_app.logger.exception("Unexpected error decoding token during logout")
+        return resp
+
+    if not jti:
+        # Nothing to revoke; cookie is cleared already
+        return resp
+
+    # Convert exp_ts to timezone-aware datetime if present
+    expires_at = None
+    try:
+        if exp_ts is not None:
+            expires_at = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
+    except Exception:
+        expires_at = None
+
+    # Insert RevokedToken record (idempotent)
+    sess = None
+    try:
+        sess = get_session()
+        rt = RevokedToken(jti=jti, revoked_at=datetime.now(tz=timezone.utc), expires_at=expires_at)
+        sess.add(rt)
+        try:
+            sess.commit()
+        except IntegrityError:
+            # Duplicate insertion (already revoked) -> idempotent success
+            sess.rollback()
+        except Exception:
+            sess.rollback()
+            current_app.logger.exception("Error committing RevokedToken during logout")
+    except Exception:
+        current_app.logger.exception("Error creating RevokedToken during logout")
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    # Return cleared cookie response
+    return resp
+
+
+# Optional protected endpoint for integration tests to assert jwt_required behavior
+@auth_bp.route("/me", methods=["GET"])
+@jwt_utils.jwt_required
+def me():
+    # g.current_user is set by jwt_required decorator
+    user = getattr(g, "current_user", None)
+    if not user:
+        return jsonify({"error": "no_current_user"}), 401
+    return jsonify({"id": user.id, "email": user.email}), 200
+
+
+# -------------------------
+# Password Reset: Templates + Endpoints (KAN-109)
+# -------------------------
+
+# Templates: must include the mandatory CSRF hidden input per Epic.
+_password_reset_request_template = """<h2>Password Reset</h2>
+<p>Enter the email address associated with your account. If an account exists, you'll receive a reset link (dev: logged).</p>
+<form method="POST" action="/auth/password-reset-request">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div>
+    <label>Email: <input name="email" type="email" required /></label>
+  </div>
+  <div>
+    <button type="submit">Request Password Reset</button>
+  </div>
+</form>
+<p><a href="/auth/">Back to Auth</a></p>
+"""
+
+_password_reset_requested_template = """<h2>Password Reset Requested</h2>
+<p class="success">If that email exists, a password reset link has been sent (dev: logged). Please check your email.</p>
+<p><a href="/auth/">Back to Auth</a></p>
+"""
+
+_password_reset_form_template = """<h2>Reset Password</h2>
+<form method="POST" action="/auth/password-reset/{{ token | e }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div>
+    <label>New password: <input name="password" type="password" required /></label>
+  </div>
+  <div>
+    <label>Confirm password: <input name="password_confirm" type="password" required /></label>
+  </div>
+  <div>
+    <button type="submit">Set New Password</button>
+  </div>
+</form>
+<p><a href="/auth/">Back to Auth</a></p>
+"""
+
+_password_reset_success_template = """<h2 class="success">Password Reset Successful</h2>
+<p>Your password has been updated. You can now sign in with your new password.</p>
+<p><a href="/auth/login">Login</a></p>
+"""
+
+_password_reset_error_template = """<h2 class="error">Password Reset Error</h2>
+<p class="error">{{ message }}</p>
+<form method="GET" action="/auth/password-reset-request">
+  <button type="submit">Request a new reset link</button>
+</form>
+"""
+
+# Lightweight in-memory rate limiter for reset requests (per-app; restart clears)
+# Structure: { key: [timestamp1, timestamp2, ...] }
+_password_reset_rl = {}
+from time import time as _now_ts
+
+def _rate_limit_allow(key: str, window_seconds: int, limit: int) -> bool:
+    """
+    Returns True if request should be allowed. Mutates the in-memory store.
+    key: a string identifying the principal (email or IP)
+    window_seconds: time window to consider
+    limit: max requests allowed in window
+    """
+    try:
+        ts = int(_now_ts())
+        bucket = _password_reset_rl.get(key) or []
+        # prune
+        cutoff = ts - int(window_seconds)
+        bucket = [t for t in bucket if t > cutoff]
+        if len(bucket) >= limit:
+            _password_reset_rl[key] = bucket
+            return False
+        bucket.append(ts)
+        _password_reset_rl[key] = bucket
+        return True
+    except Exception:
+        # On any unexpected error, be conservative and allow (do not block legitimate usage)
+        return True
+
+def _append_trace(entry: str):
+    """
+    Append a trace line to trace_KAN-109.txt for architectural memory.
+    This is intentionally lightweight: append-only, newline-delimited.
+    """
+    try:
+        trace_path = os.path.join(os.getcwd(), "trace_KAN-109.txt")
+        with open(trace_path, "a", encoding="utf-8") as fh:
+            fh.write(entry.rstrip() + "\n")
+    except Exception:
+        # Never fail the request because tracing failed; but log
+        current_app.logger.exception("Failed to write KAN-109 trace file")
+
+@auth_bp.route("/password-reset-request", methods=["GET"])
+def password_reset_request_get():
+    """Render the password reset request form."""
+    return render_layout(_password_reset_request_template)
+
+@auth_bp.route("/password-reset-request", methods=["POST"])
+def password_reset_request_post():
+    """
+    POST /auth/password-reset-request
+    - Accepts form with 'email' and CSRF (CSRF enforced by template inclusion/wiring)
+    - Rate-limits per IP and per email
+    - Does NOT reveal whether the email exists -> always returns a generic confirmation page.
+    - If user exists: creates a purpose-scoped token using jwt_utils.create_access_token with purpose='password_reset'
+      and logs a dev reset link (current_app.logger.info). Also writes trace_KAN-109.txt with event.
+    """
+    form = request.form or {}
+    email = (form.get("email") or "").strip().lower()
+    # Simple rate-limiting: per-email 5/hour, per-IP 10/hour
+    rl_email_key = f"pwreset:email:{email}"
+    rl_ip_key = f"pwreset:ip:{request.remote_addr or 'unknown'}"
+    email_allowed = _rate_limit_allow(rl_email_key, window_seconds=60 * 60, limit=5)
+    ip_allowed = _rate_limit_allow(rl_ip_key, window_seconds=60 * 60, limit=10)
+    if not (email_allowed and ip_allowed):
+        # Return generic response (do not reveal throttling details to attacker)
+        current_app.logger.warning("Password reset rate-limited for email=%s ip=%s", email, request.remote_addr)
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RATE_LIMIT email={email} ip={request.remote_addr}")
+        return render_layout(_password_reset_requested_template)
+
+    # Attempt to find user and issue token if found (do not reveal existence)
+    sess = None
+    try:
+        sess = get_session()
+        user = None
+        if email:
+            user = sess.query(User).filter(User.email == email).first()
+        if user:
+            try:
+                jti = str(uuid4())
+                # Use a purpose-scoped token with a configured expiry for resets
+                reset_exp = int(current_app.config.get("PASSWORD_RESET_EXP_SECONDS", 60 * 60))  # default 1 hour
+                token = jwt_utils.create_access_token(user_id=user.id, jti=jti, purpose="password_reset", exp_seconds=reset_exp)
+                reset_url = url_for("auth.password_reset_form_get", token=token, _external=True)
+                # Dev: log the link. Tests/integration extract token from logs.
+                current_app.logger.info("Password reset link (dev): %s", reset_url)
+                _append_trace(f"{datetime.utcnow().isoformat()}Z ISSUED_RESET email={email} user_id={user.id} jti={jti} reset_url={reset_url}")
+                # Do not persist SessionToken here; rely on RevokedToken table on revocation.
+            except Exception:
+                current_app.logger.exception("Error issuing password reset token for user_id=%s", getattr(user, "id", None))
+                # Continue to generic response
+        else:
+            # No user found: do nothing sensitive, but record trace of attempt to operational logs (no details)
+            _append_trace(f"{datetime.utcnow().isoformat()}Z REQUEST_NO_ACCOUNT email={email} ip={request.remote_addr}")
+    except Exception:
+        current_app.logger.exception("Error handling password reset request for email=%s", email)
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    # Always return the same confirmation page to avoid user enumeration
+    return render_layout(_password_reset_requested_template)
+
+# Named GET endpoint to render the form (so user can open link)
+@auth_bp.route("/password-reset/<token>", methods=["GET"])
+def password_reset_form_get(token):
+    """
+    Render the password reset form for a token. The form posts to the same URL with the token.
+    We render the page regardless of token validity to avoid leaking.
+    """
+    return render_layout(_password_reset_form_template, token=token)
+
+@auth_bp.route("/password-reset/<token>", methods=["POST"])
+def password_reset_form_post(token):
+    """
+    POST /auth/password-reset/<token>
+    - Validates token by decoding with jwt_utils.decode_token (which enforces signature and exp).
+    - Verifies payload.purpose == 'password_reset'.
+    - Verifies token jti is not already revoked (jwt_utils.is_revoked).
+    - Accepts 'password' and 'password_confirm' fields and CSRF token in the form.
+    - On success: updates user's password_hash (using passwords.hash_password), commits,
+      inserts RevokedToken record for the token's jti (with expires_at from token) to prevent reuse,
+      writes trace entry, and renders success template.
+    - On failure: renders error template with a generic message (no sensitive details).
+    """
+    form = request.form or {}
+    new_pwd = form.get("password") or ""
+    confirm = form.get("password_confirm") or ""
+    if not new_pwd or not confirm:
+        return render_layout(_password_reset_error_template, message="Password and confirmation are required"), 400
+    if new_pwd != confirm:
+        return render_layout(_password_reset_error_template, message="Passwords do not match"), 400
+    # Enforce minimal password policy in dev scaffold (example): length >= 8
+    if len(new_pwd) < int(current_app.config.get("MIN_PASSWORD_LENGTH", 8)):
+        return render_layout(_password_reset_error_template, message=f"Password must be at least {int(current_app.config.get('MIN_PASSWORD_LENGTH', 8))} characters"), 400
+
+    # Decode and verify token
+    try:
+        payload = jwt_utils.decode_token(token)
+    except ExpiredSignatureError:
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_EXPIRED token={token[:32]}...")
+        return render_layout(_password_reset_error_template, message="Reset link has expired"), 400
+    except InvalidTokenError:
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_INVALID token={token[:32]}...")
+        return render_layout(_password_reset_error_template, message="Invalid reset link"), 400
+    except Exception:
+        current_app.logger.exception("Unexpected error decoding reset token")
+        return render_layout(_password_reset_error_template, message="Invalid reset link"), 400
+
+    # Validate purpose
+    purpose = payload.get("purpose")
+    if purpose != "password_reset":
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_WRONG_PURPOSE payload_purpose={purpose}")
+        return render_layout(_password_reset_error_template, message="Invalid reset link"), 400
+
+    jti = payload.get("jti")
+    user_id = payload.get("user_id")
+    exp_ts = payload.get("exp")
+    if not jti or not user_id:
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_MISSING_CLAIMS payload={payload}")
+        return render_layout(_password_reset_error_template, message="Invalid reset link"), 400
+
+    # Check revocation
+    try:
+        if jwt_utils.is_revoked(jti):
+            _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_REVOKED jti={jti} user_id={user_id}")
+            return render_layout(_password_reset_error_template, message="This reset link has already been used or invalidated"), 400
+    except Exception:
+        # On DB/check errors, be conservative and reject
+        current_app.logger.exception("Error checking revocation for jti=%s", jti)
+        return render_layout(_password_reset_error_template, message="Unable to validate reset link"), 500
+
+    # Update password and revoke token
+    sess = None
+    try:
+        sess = get_session()
+        user = sess.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_FAILED_NO_USER user_id={user_id}")
+            return render_layout(_password_reset_error_template, message="Invalid reset link"), 400
+
+        # Hash and set
+        try:
+            hashed = passwords.hash_password(new_pwd)
+            user.password_hash = hashed
+            sess.add(user)
+            # Insert RevokedToken record to block reuse
+            expires_at = None
+            try:
+                if exp_ts is not None:
+                    expires_at = datetime.fromtimestamp(int(exp_ts), tz=timezone.utc)
+            except Exception:
+                expires_at = None
+            rt = RevokedToken(jti=jti, revoked_at=datetime.now(tz=timezone.utc), expires_at=expires_at)
+            sess.add(rt)
+            try:
+                sess.commit()
+            except IntegrityError:
+                # Already revoked record: rollback but consider operation completed
+                sess.rollback()
+                # Ensure password was persisted; set again in a separate transaction
+                try:
+                    sess.add(user)
+                    sess.commit()
+                except Exception:
+                    sess.rollback()
+                    current_app.logger.exception("Failed to commit password update after revocation conflict")
+                    return render_layout(_password_reset_error_template, message="Internal error"), 500
+        except Exception:
+            sess.rollback()
+            current_app.logger.exception("Error updating password for user_id=%s", user_id)
+            return render_layout(_password_reset_error_template, message="Internal error"), 500
+
+        # Successful reset
+        _append_trace(f"{datetime.utcnow().isoformat()}Z RESET_SUCCESS user_id={user.id} jti={jti}")
+        return render_layout(_password_reset_success_template)
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+
+# Shortener blueprint endpoints (minimal scaffolding)
+@shortener_bp.route("/", methods=["GET"])
+def shorten_index():
+    return render_layout(_shorten_index_template)
+
+
+@shortener_bp.route("/create", methods=["POST"])
+def shorten_create():
+    target = request.form.get("target_url")
+    return render_layout(_shorten_result_template, target=target)
+
+
+# Analytics scaffold
+@analytics_bp.route("/", methods=["GET"])
+def analytics_index():
+    return render_layout(_analytics_index_template)
+
+
+# -------------------------
+# App factory
+# -------------------------
+def create_app(config_name=None):
+    """
+    create_app factory pattern.
+
+    - Loads configuration from config.py (DevConfig, ProdConfig, TestingConfig) selected by argument
+      or FLASK_ENV environment variable.
+    - Minimal dev-safe defaults preserved for local imports.
+    - Wires CSRFProtect if available.
+    - Attaches SQLAlchemy engine and scoped_session to app via models.init_db for downstream use.
+    - Registers blueprints.
+    - Provides /health/db for integration tests.
+    """
+    app = Flask(__name__)
+    app.template_folder = None  # we use inline templates via render_template_string
+    app.static_folder = None
+
+    # Attempt to load centralized configuration helpers (surgical).
+    try:
+        from config import get_config_class, apply_config_to_app, validate_production_config, ProdConfig  # type: ignore
+    except Exception:
+        app.config.setdefault("SECRET_KEY", "dev-secret-key")
+        default_sqlite_path = os.path.join(os.getcwd(), "dev.db")
+        app.config.setdefault("DATABASE_URL", f"sqlite:///{default_sqlite_path}")
+    else:
+        cfg_cls = get_config_class(config_name)
+        apply_config_to_app(app, cfg_cls)
+        if cfg_cls is ProdConfig:
+            validate_production_config(app.config)
+        app.config.setdefault("SECRET_KEY", "dev-secret-key")
+        default_sqlite_path = os.path.join(os.getcwd(), "dev.db")
+        app.config.setdefault("DATABASE_URL", f"sqlite:///{default_sqlite_path}")
+
+    # CSRF protection wiring (if Flask-WTF is installed)
+    if CSRFProtect is not None:
+        try:
+            csrf = CSRFProtect()
+            csrf.init_app(app)
+        except Exception:
+            csrf = None
+    else:
+        csrf = None
+
+    # Expose csrf_token() in templates; if flask-wtf not available, provide a safe lambda
+    if generate_csrf is not None:
+        app.jinja_env.globals["csrf_token"] = generate_csrf
+    else:
+        app.jinja_env.globals["csrf_token"] = lambda: ""
+
+    # Attach render_layout to Jinja globals for templates that might expect it
+    app.jinja_env.globals["render_layout"] = render_layout
+
+    # Initialize DB via models.init_db(app)
+    init_db(app)
+
+    # Register blueprints
+    app.register_blueprint(auth_bp, url_prefix="/auth")
+    app.register_blueprint(shortener_bp, url_prefix="/s")
+    app.register_blueprint(analytics_bp, url_prefix="/analytics")
+
+    @app.route("/", methods=["GET"])
+    def index():
+        body = "<h1>Welcome to Smart Link (dev scaffold)</h1><p>Use the nav to browse.</p>"
+        return render_layout(body)
+
+    # Health endpoint for DB connectivity (uses Session to run a simple SELECT 1)
+    @app.route("/health/db")
+    def health_db():
+        try:
+            sess = get_session()
+            try:
+                # Try a lightweight query to ensure DB connectivity
+                sess.execute("SELECT 1")
+            finally:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+            return jsonify({"status": "ok", "db": True}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "db": False, "detail": str(e)}), 500
+
+    return app
+
+
+# If executed directly, run a development server (useful for manual testing)
+if __name__ == "__main__":
+    application = create_app()
+    print("Starting dev server on http://127.0.0.1:5000")
+    application.run(debug=True)

@@ -1,0 +1,17 @@
+# Minimal requirements for the immutable stack & common dev/test tools.
+# Operators may pin explicit versions as desired.
+Flask
+Flask-WTF
+SQLAlchemy
+psycopg2-binary
+argon2-cffi
+PyJWT
+Flask-Talisman
+gunicorn
+requests
+alembic
+pytest
+pytest-cov
+# Optional utilities referenced by repository modules (kept permissive)
+python-dotenv
+--- END FILE: requirements.txt ---

@@ -1,0 +1,42 @@
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+include = '\.pyi?$'
+skip-string-normalization = false
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+force_grid_wrap = 0
+include_trailing_comma = true
+known_first_party = ["routes", "utils", "models"]
+default_section = "THIRDPARTY"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-select = ["E", "F", "W", "C", "B"]
+# Keep a small set of ignores that are consistent with Black/isort style choices
+ignore = ["E203", "W503"]
+# Allow ruff to auto-fix where possible; CI still runs checks for failing files
+per-file-ignores = { "tests/*" = ["D", "S101"] }
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+    "env",
+    "tests/data",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+--- END FILE ---

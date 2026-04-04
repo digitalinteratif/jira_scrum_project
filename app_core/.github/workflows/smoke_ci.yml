@@ -1,0 +1,33 @@
+name: Smoke CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install system deps (docker is preinstalled on hosted runners)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install wheel
+          # Install runtime deps needed for the smoke script: gunicorn and requests
+          pip install gunicorn requests sqlalchemy
+
+      - name: Run smoke script
+        env:
+          # Allow override of Postgres image if desired
+          SMOKE_PG_IMAGE: postgres:15-alpine
+        run: |
+          python bin/smoke_ci.py
+--- END FILE: .github/workflows/smoke_ci.yml ---

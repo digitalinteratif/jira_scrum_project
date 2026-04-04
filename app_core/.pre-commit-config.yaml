@@ -1,0 +1,55 @@
+repos:
+  # Black - code formatter
+  - repo: https://github.com/psf/black
+    rev: 23.9.1
+    hooks:
+      - id: black
+        name: black (code formatter)
+        args: ["--line-length=88", "--target-version=py312"]
+        files: \.pyi?$   # only python files
+
+  # Ruff - fast linter / fixer
+  - repo: https://github.com/charliermarsh/ruff
+    rev: v0.15.0
+    hooks:
+      - id: ruff
+        name: ruff (fast linter)
+        args: ["--fix", "--quiet"]
+        files: \.py$
+
+  # isort - import sorting
+  - repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        name: isort (sort imports)
+        args: ["--profile", "black"]
+        files: \.py$
+
+  # flake8 - compatibility/extra linting (kept lightweight; ruff covers most)
+  - repo: https://github.com/PyCQA/flake8
+    rev: 6.1.0
+    hooks:
+      - id: flake8
+        name: flake8 (additional lint checks)
+        additional_dependencies: []
+        args: ["--max-line-length=88"]
+
+  # Optional: safety - check for vulnerable dependencies (network required)
+  # Marked optional in CONTRIBUTING.md; CI will run it when network allowed.
+  - repo: https://github.com/pyupio/safety
+    rev: 1.10.3
+    hooks:
+      - id: safety
+        name: safety (optional dependency vulnerability scan)
+        args: ["check", "--full-report"]
+
+  # Local repository hook hint: run pre-commit's all-checks quickly on demand
+  - repo: local
+    hooks:
+      - id: pre-commit-run-all
+        name: pre-commit-run-all (helper)
+        entry: bash -c 'pre-commit run --all-files'
+        language: system
+        pass_filenames: false
+--- END FILE ---

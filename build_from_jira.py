@@ -1,8 +1,13 @@
 import os
 import re
+import sys
+import json
 import subprocess
 import logging
-from datetime import datetime
+import codecs
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import BaseTool
@@ -10,193 +15,302 @@ from pydantic import BaseModel, Field
 from jira import JIRA
 from jira.exceptions import JIRAError
 
-# --- 1. CONFIGURATION & SETUP ---
+# --- 1. CONFIGURATION, LOGGING & WINDOWS UNICODE FIX ---
 load_dotenv(override=True)
 
-TARGET_JIRA_TICKET = os.environ.get("TARGET_JIRA_TICKET")
-CODE_FILE = "generated_app.py"
-LOG_DIR = "agent_logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+# Force UTF-8 for Windows Console to prevent 'charmap' errors with emojis
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
 
+TARGET_JIRA_TICKET = os.environ.get("TARGET_JIRA_TICKET")
+PROJECT_ROOT = "app_core"  
+ENTRY_POINT = "app.py"     
+LOG_DIR = "agent_logs"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(PROJECT_ROOT, exist_ok=True)
+
+# Generate unique log filename for the session
 log_ticket_id = re.sub(r'[^\w\s-]', '', TARGET_JIRA_TICKET if TARGET_JIRA_TICKET else "UNTITLED").strip().replace(' ', '_')
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = os.path.join(LOG_DIR, f"build_{log_ticket_id}_{timestamp}.log")
 
+# Setup Handlers with UTF-8 encoding
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+stream_handler = logging.StreamHandler(sys.stdout)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+    handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger("JiraBuilder")
 
-def parse_model_env(env_value, default):
-    if not env_value: return default
-    # Extract name from pattern model='name' or just return the string
-    match = re.search(r"model=['\"]([^'\"]+)['\"]", env_value)
-    if match: return match.group(1)
-    return env_value
-
-# --- 2. FETCH REQUIREMENTS (Recursive Epic Retrieval) ---
-def get_ticket_details(ticket_id):
-    logger.info(f"🔗 Connecting to Jira: {ticket_id}")
+# --- 2. JIRA CLIENT UTILITIES ---
+def get_jira_client():
     jira_server = os.environ.get("JIRA_SERVER")
     jira_email = os.environ.get("JIRA_EMAIL")
     jira_token = os.environ.get("JIRA_API_TOKEN")
-    jira_client = JIRA(options={'server': jira_server}, basic_auth=(jira_email, jira_token))
+    return JIRA(options={'server': jira_server}, basic_auth=(jira_email, jira_token))
+
+def get_ticket_details_from_issue(jira_client, issue):
+    """Formats details for an issue, including parent Epic context."""
+    summary = issue.fields.summary
+    description = issue.fields.description or "No description provided."
+    full_context = f"--- TARGET TICKET: {issue.key} ---\nTITLE: {summary}\nDESCRIPTION:\n{description}\n"
+
+    # Hierarchy Awareness: Fetch Parent Epic if this is a Story
+    parent = getattr(issue.fields, 'parent', None)
+    epic_key = None
+    if parent:
+        epic_key = parent.key
+    elif hasattr(issue.fields, 'customfield_10011'): 
+        epic_key = issue.fields.customfield_10011
+
+    if epic_key:
+        logger.info(f"🔍 Found Parent Epic: {epic_key}. Fetching global rules...")
+        epic_issue = jira_client.issue(epic_key)
+        epic_desc = epic_issue.fields.description or ""
+        full_context = f"--- GLOBAL FEATURE OVERVIEW (From Epic {epic_key}) ---\n{epic_desc}\n\n" + full_context
     
+    return full_context
+
+def get_epic_children(jira_client, epic_id):
+    """Finds all child stories and filters by status."""
     try:
-        issue = jira_client.issue(ticket_id)
-        summary = issue.fields.summary
-        description = issue.fields.description or "No description provided."
+        issue = jira_client.issue(epic_id)
+        if issue.fields.issuetype.name != 'Epic':
+            return [issue]
         
-        full_context = f"--- TARGET TICKET: {ticket_id} ---\nTITLE: {summary}\nDESCRIPTION:\n{description}\n"
-
-        # RECURSIVE CONTEXT: Check for Parent Epic
-        parent = getattr(issue.fields, 'parent', None)
-        epic_key = None
+        logger.info(f"📂 '{epic_id}' is an Epic. Searching for child stories...")
+        # JQL search for all linked children
+        jql = f'parent = "{epic_id}" OR "Epic Link" = "{epic_id}" ORDER BY created ASC'
+        children = jira_client.search_issues(jql)
         
-        # Check standard parent field or common Epic Link custom field
-        if parent:
-            epic_key = parent.key
-        elif hasattr(issue.fields, 'customfield_10011'): # Common Epic Link ID
-            epic_key = issue.fields.customfield_10011
-
-        if epic_key:
-            logger.info(f"🔍 Found Parent Epic: {epic_key}. Fetching global rules...")
-            epic_issue = jira_client.issue(epic_key)
-            epic_desc = epic_issue.fields.description or ""
-            full_context = f"--- GLOBAL FEATURE OVERVIEW (From Epic {epic_key}) ---\n{epic_desc}\n\n" + full_context
-        
-        return full_context
-
+        if not children:
+            logger.warning(f"Empty Epic: No children found for {epic_id}.")
+            return [issue]
+            
+        return children
     except JIRAError as e:
-        logger.error(f"❌ Jira Error: {e.text}")
-        return f"Error: {e.text}"
+        logger.error(f"❌ Failed to check Epic status: {e.text}")
+        return []
 
-# --- 3. RETRIEVE EXISTING CODE ---
-def get_existing_code():
-    if os.path.exists(CODE_FILE):
-        with open(CODE_FILE, "r", encoding="utf-8") as f:
+def transition_to_done(jira_client, issue):
+    """Automatically transitions a successful Jira issue to 'Done'."""
+    try:
+        transitions = jira_client.transitions(issue)
+        target_transition = next((t for t in transitions if 'done' in t['name'].lower()), None)
+        
+        if target_transition:
+            jira_client.transition_issue(issue, target_transition['id'])
+            logger.info(f"✅ Issue {issue.key} transitioned to DONE.")
+        else:
+            logger.warning(f"⚠️ No 'Done' transition found for {issue.key}.")
+    except JIRAError as e:
+        logger.error(f"❌ Failed to transition {issue.key}: {e.text}")
+
+# --- 3. RETRIEVE EXISTING CODEBASE (Codebase Awareness) ---
+def get_existing_codebase():
+    """Aggregates all files in the app_core directory for AI context."""
+    code_map = ""
+    if not os.path.exists(PROJECT_ROOT):
+        return "CODEBASE IS EMPTY."
+    
+    for path in Path(PROJECT_ROOT).rglob('*.py'):
+        relative_path = path.relative_to(PROJECT_ROOT)
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-            # Python Stack Lock Check
-            if "require(" in content or "const " in content:
-                logger.warning("⚠️ Non-Python code detected. Forcing clean Python rewrite.")
-                return "ERROR: Existing code is Javascript. You MUST ignore its structure and build in Python/Flask."
-            return content
-    return ""
+            code_map += f"\n--- FILE: {relative_path} ---\n{content}\n"
+    
+    return code_map if code_map else "CODEBASE IS EMPTY."
 
-logger.info("Initializing context retrieval...")
-jira_requirements = get_ticket_details(TARGET_JIRA_TICKET)
-existing_context = get_existing_code()
-
-# --- 4. THE QA TESTING TOOL ---
+# --- 4. THE QA TESTING TOOL (Stability Guarantee) ---
 class PythonTesterSchema(BaseModel):
-    code_string: str = Field(..., description="The full Python source code to test.")
+    codebase_payload: str = Field(..., description="The full proposed codebase update.")
 
 class PythonTesterTool(BaseTool):
-    name: str = "Python Code Execution and Syntax Tester"
-    description: str = "Executes code. Returns SUCCESS if stable, or error."
+    name: str = "python_stability_tester"
+    description: str = "Boots the MODULAR app entry point. Returns SUCCESS if stable for 10s."
     args_schema: type[BaseModel] = PythonTesterSchema
 
-    def _run(self, code_string: str) -> str:
-        code = code_string.replace('```python', '').replace('```', '').strip()
-        with open("ai_test_run.py", "w", encoding="utf-8") as f:
-            f.write(code)
+    def _run(self, codebase_payload: str) -> str:
+        test_dir = "temp_stability_test"
+        os.makedirs(test_dir, exist_ok=True)
+        
+        # Parse multi-file markers
+        files = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', codebase_payload, re.DOTALL)
+        
+        for file_path, content in files:
+            full_path = Path(test_dir) / file_path.strip()
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content.strip())
+        
+        entry_file = Path(test_dir) / ENTRY_POINT
+        if not entry_file.exists():
+            return f"CRASH: Missing entry point '{ENTRY_POINT}' in update."
+
         try:
-            result = subprocess.run(["python", "ai_test_run.py"], capture_output=True, text=True, timeout=4)
-            if result.returncode != 0: return f"CRASH:\n{result.stderr[-500:]}"
+            result = subprocess.run([sys.executable, str(entry_file)], capture_output=True, text=True, timeout=10)
+            if result.returncode != 0: 
+                return f"CRASH:\n{result.stderr[-500:]}"
             return "SUCCESS"
-        except subprocess.TimeoutExpired: return "SUCCESS"
-        except Exception as e: return f"Error: {e}"
+        except subprocess.TimeoutExpired:
+            return "SUCCESS" 
+        except Exception as e:
+            return f"Error: {e}"
 
 python_tester_tool = PythonTesterTool()
 
 # --- 5. THE MODELS ---
-arch_model = parse_model_env(os.environ.get("architect_llm"), "o3-mini")
-code_model = parse_model_env(os.environ.get("coder_llm"), "gpt-5-codex")
-architect_llm = LLM(model=arch_model)
-coder_llm = LLM(model=code_model)
+openai_llm = LLM(
+    model="gpt-5-mini-2025-08-07",
+    api_key=os.environ.get("OPENAI_API_KEY")
+)
 
-# --- 6. THE AGENTS ---
+# --- 6. THE AGENTS (Hierarchical Management) ---
+
+scrum_master = Agent(
+    role='Expert Scrum Master',
+    goal='Oversee the surgical integration of Jira tickets into a MODULAR codebase.',
+    backstory="""You are the manager of a high-performing team. You ensure 
+    the team respects the 'Modular Service Architecture' and 'ID Filter' rules. 
+    You prevent context drift by ensuring new updates are backward compatible.""",
+    llm=openai_llm,
+    verbose=True
+)
+
 architect = Agent(
-    role='Full-Stack Security Architect',
-    goal='Design surgical updates following the Global Feature Overview and Story requirements.',
-    backstory="""You are a security-first architect. You STRICTLY follow the 
-    'Immutable Technology Stack' and 'Agent Contextual Awareness Rules'. 
-    You always verify that a plan includes CSRF tokens and uses the 
-    render_layout pattern. You never allow technology drift.""",
-    llm=architect_llm,
+    role='Modular Systems Architect',
+    goal='Design surgical updates across multiple Python modules.',
+    backstory="""You design the blueprint for modular separation. You mandate 
+    SQLAlchemy naming conventions and ensure CSRF protection is in place.""",
+    llm=openai_llm,
     verbose=True
 )
 
 coder = Agent(
     role='Senior Python Developer',
-    goal='Implement the blueprint in Python/Flask, ensuring global standards are met.',
-    backstory="""You specialize in high-precision Python. You ensure that 
-    every form has a CSRF token and that the single-file constraint is 
-    maintained. You merge Story requirements into the existing code without 
-    breaking the global rules defined in the Epic overview.""",
-    llm=coder_llm,
+    goal='Implement modular Flask code across multiple files.',
+    backstory="""You write robust, surgical Python. You return updates as 
+    file blocks starting with '--- FILE: path ---'. You never truncate file content.""",
+    llm=openai_llm,
     verbose=True
 )
 
 qa_auditor = Agent(
-    role='Compliance & Security Auditor',
-    goal='Verify the code satisfies both the Story AND the Epic Overview standards.',
-    backstory="""You audit code for regressions and compliance. You reject 
-    any code that lacks CSRF tokens, attempts to use Javascript, or 
-    violates the single-file mandate. You verify BASE_URL and Domain logic.""",
-    llm=coder_llm,
+    role='Modular Compliance Auditor',
+    goal='Verify the codebase update passes stability and security audits.',
+    backstory="""You are the gatekeeper. You run the stability tester and 
+    ensure all security guardrails (CSRF, ID filters) are maintained.""",
+    llm=openai_llm,
     verbose=True,
     tools=[python_tester_tool]
 )
 
-# --- 7. THE TASKS ---
-blueprint_task = Task(
-    description=(
-        f"Context & Requirements:\n{jira_requirements}\n\nExisting Code:\n{existing_context}\n\n"
-        "TASK: Create a SURGICAL Blueprint. You MUST:\n"
-        "1. Validate the plan against the GLOBAL FEATURE OVERVIEW (Section 2 & 4).\n"
-        "2. Address the specific Story requirements for the delta.\n"
-        "3. Ensure the render_layout and CSRF mandates are satisfied."
-    ),
-    expected_output="A Technical Spec that satisfies both global and story-specific requirements.",
-    agent=architect
-)
+# --- 7. THE BUILD EXECUTION LOOP ---
+def run_build_cycle(issue, current_index, total_tickets):
+    """Executes the hierarchical build for a single ticket."""
+    start_time = time.time()
+    jira_client = get_jira_client()
+    jira_requirements = get_ticket_details_from_issue(jira_client, issue)
+    existing_codebase = get_existing_codebase()
 
-coding_task = Task(
-    description=(
-        "Update 'generated_app.py' surgically.\n"
-        f"SOURCE:\n{existing_context}\n\n"
-        "Rules: Maintain 100% Python/Flask. Ensure every <form> has CSRF tokens. "
-        "Use the render_layout helper. Preserve the single-file structure."
-    ),
-    expected_output="The full updated Python script.",
-    agent=coder,
-    context=[blueprint_task]
-)
+    # Trace Logging Mandate: Per-ticket interaction log
+    trace_log_file = os.path.join(LOG_DIR, f"trace_{issue.key}_{timestamp}.txt")
 
-audit_task = Task(
-    description=(
-        "Audit for Compliance. Check: CSRF tokens in forms, correct Domain usage, "
-        "and successful stability test. Your final response MUST be ONLY the "
-        "code in a ```python block."
-    ),
-    expected_output="The finalized, compliant Python code.",
-    agent=qa_auditor,
-    context=[coding_task]
-)
+    blueprint_task = Task(
+        description=(
+            f"Requirements:\n{jira_requirements}\n\nExisting Codebase:\n{existing_codebase}\n\n"
+            "TASK: Create a SURGICAL Blueprint identifying specific module changes."
+        ),
+        expected_output="A technical specification for the modular update.",
+        agent=architect
+    )
 
-# --- 8. EXECUTION ---
-crew = Crew(agents=[architect, coder, qa_auditor], tasks=[blueprint_task, coding_task, audit_task], process=Process.sequential, verbose=True)
-result = crew.kickoff()
+    coding_task = Task(
+        description=(
+            "Implement the update using Blueprints. Return full content of modified files.\n"
+            "Format: --- FILE: path/to/file.py ---\n[content]"
+        ),
+        expected_output="The complete codebase update with FILE markers.",
+        agent=coder,
+        context=[blueprint_task]
+    )
 
-# --- 9. SAVE ---
-output_string = result.raw if hasattr(result, 'raw') else str(result)
-code_match = re.search(r'```python\n(.*?)\n```', output_string, re.DOTALL)
-if code_match:
-    with open(CODE_FILE, "w", encoding="utf-8") as f:
-        f.write(code_match.group(1))
-    print(f"\n🎉 SUCCESS! Context-aware surgical update for {TARGET_JIRA_TICKET} complete.")
-else:
-    print("\n⛔ Failed to isolate Python code block.")
+    audit_task = Task(
+        description="Run stability tests and verify security guardrails. Output ONLY the finalized code blocks.",
+        expected_output="The finalized modular codebase update.",
+        agent=qa_auditor,
+        context=[coding_task]
+    )
+
+    # Execute Hierarchical Process
+    crew = Crew(
+        agents=[scrum_master, architect, coder, qa_auditor],
+        tasks=[blueprint_task, coding_task, audit_task],
+        process=Process.hierarchical,
+        manager_llm=openai_llm,
+        verbose=True,
+        output_log_file=trace_log_file
+    )
+
+    logger.info(f"🔨 [{current_index}/{total_tickets}] Processing ticket: {issue.key}...")
+    result = crew.kickoff()
+
+    # Parse and Save to PROJECT_ROOT
+    output_string = result.raw if hasattr(result, 'raw') else str(result)
+    files_found = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', output_string, re.DOTALL)
+
+    if files_found:
+        for file_path, content in files_found:
+            full_path = Path(PROJECT_ROOT) / file_path.strip()
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content.strip())
+        
+        transition_to_done(jira_client, issue)
+        duration = time.time() - start_time
+        logger.info(f"✅ Issue {issue.key} integrated. Cycle took {duration:.2f}s.")
+        return duration
+    else:
+        logger.error(f"⛔ Failed to isolate code blocks for {issue.key}.")
+        return False
+
+# --- 8. MAIN ENTRY POINT ---
+if __name__ == "__main__":
+    if not TARGET_JIRA_TICKET:
+        logger.error("❌ TARGET_JIRA_TICKET not found in .env.")
+        sys.exit(1)
+
+    client = get_jira_client()
+    all_issues = get_epic_children(client, TARGET_JIRA_TICKET)
+    
+    # Status-Based Execution: Skip 'Done'
+    tickets_to_process = [iss for iss in all_issues if iss.fields.status.name.lower() != 'done']
+    total = len(tickets_to_process)
+    skipped = len(all_issues) - total
+
+    if skipped > 0:
+        logger.info(f"⏭️ Skipped {skipped} completed tickets.")
+
+    logger.info(f"🚀 Starting build for {total} pending tickets...")
+    
+    overall_start_time = time.time()
+    cycle_durations = []
+
+    for i, issue in enumerate(tickets_to_process, 1):
+        if i > 1:
+            avg = sum(cycle_durations) / len(cycle_durations)
+            eta = str(timedelta(seconds=int(avg * (total - (i-1)))))
+            logger.info(f"📊 Progress: {((i-1)/total)*100:.1f}% | Avg: {avg:.1f}s | ETA: {eta}")
+
+        duration = run_build_cycle(issue, i, total)
+        if duration:
+            cycle_durations.append(duration)
+        else:
+            logger.error(f"🛑 Build failed at {issue.key}. Stopping iteration.")
+            break
+
+    logger.info(f"🏁 Finished. Time elapsed: {str(timedelta(seconds=int(time.time() - overall_start_time)))}")

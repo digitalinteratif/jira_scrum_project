@@ -1,0 +1,67 @@
+# docker-compose.yml — dev compose for Smart Link (KAN-138)
+#
+# Usage:
+#   - Start full dev stack (app + Postgres):
+#       docker-compose up --build
+#
+#   - Start app only (using host-mounted code & SQLite fallback):
+#       # ensure DATABASE_URL is set, e.g. DATABASE_URL=sqlite:///data/local_dev.db
+#       DATABASE_URL=sqlite:///data/local_dev.db docker-compose up --build web
+#
+#   - Run tests inside the web service:
+#       docker-compose run --rm web pytest -q
+#
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # For iterative development, mount the current source into the container.
+    # In CI you may choose to omit the volume to use the baked-in image.
+    volumes:
+      - ./:/app:delegated
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Default DATABASE_URL may be overridden in .env or in the environment
+      # Examples:
+      #  - Postgres: postgresql://postgres:postgres@db:5432/postgres
+      #  - SQLite (dev): sqlite:///data/local_dev.db
+      - DATABASE_URL=${DATABASE_URL}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret}
+      - JWT_SECRET=${JWT_SECRET:-${SECRET_KEY:-dev-secret}}
+      - JWT_COOKIE_SECURE=${JWT_COOKIE_SECURE:-false}
+      - JWT_SAMESITE=${JWT_SAMESITE:-Lax}
+      - ALLOW_DEMO_USER_ID=${ALLOW_DEMO_USER_ID:-true}
+    depends_on:
+      - db
+    # Command defaults to the Dockerfile CMD; override if needed:
+    # command: ["gunicorn", "--config", "gunicorn.conf.py", "wsgi.prod_wsgi:app"]
+    # For local iterative runs prefer the bind-mounted source. For CI use the built image.
+    restart: unless-stopped
+
+  db:
+    # Postgres service used for dev integration
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+--- END FILE: docker-compose.yml ---

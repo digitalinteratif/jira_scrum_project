@@ -1,0 +1,69 @@
+name: CI — lint / format / security checks
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    name: Lint & Format & Security Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        id: pip-cache
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit==3.4.0 ruff==0.15.0 black==23.9.1 isort==5.12.0 flake8==6.1.0 safety==1.10.3
+
+      - name: Pre-commit run (all files)
+        # Enforce exact same checks locally and in CI; fail the job on violations
+        run: pre-commit run --all-files
+        env:
+          # safety may use HTTP to access DB; allow network in CI if operator config permits.
+          # Provide PYPI_CACHE or other env here if needed by org policy.
+          CI: "true"
+
+      - name: Ruff check (extra safety, redundant but fast)
+        run: ruff check .
+
+      - name: isort check
+        run: isort --check-only --diff .
+
+      - name: black check
+        run: black --check --diff .
+
+      - name: flake8 check
+        run: flake8 .
+
+      - name: Optional: safety dependency check (fail on CVEs)
+        # This step may be slow and requires network access. Fail the job on vulnerabilities.
+        # If your CI environment has restricted network, consider toggling this step via environment (SAFETY_ENABLED).
+        if: env.SAFETY_ENABLED != 'false'
+        run: |
+          # Generate requirements for safety scan (best-effort: pip freeze)
+          pip freeze > .ci-requirements.txt
+          safety check --file .ci-requirements.txt --full-report || (echo "safety found vulnerabilities" && exit 1)
+        env:
+          SAFETY_ENABLED: ${{ secrets.SAFETY_ENABLED || 'true' }}
+
+  # For very large diffs / slow runs we recommend running formatting and linting locally as documented in CONTRIBUTING.md.
+--- END FILE ---
