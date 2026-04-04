@@ -154,8 +154,10 @@ class PythonTesterTool(BaseTool):
         try:
             # Test booting the entire module with the current interpreter
             result = subprocess.run([sys.executable, str(entry_file)], capture_output=True, text=True, timeout=10)
-            if result.returncode != 0: 
-                return f"CRASH:\n{result.stderr[-500:]}"
+            # CRITICAL FIX: Even if the code runs, we must check if it's logging import errors or name errors
+            stderr = result.stderr.lower()
+            if result.returncode != 0 or "nameerror" in stderr or "importerror" in stderr: 
+                return f"CRASH/ERROR DETECTED:\n{result.stderr[-800:]}"
             return "SUCCESS"
         except subprocess.TimeoutExpired:
             return "SUCCESS" # Web servers timeout by design
@@ -196,8 +198,9 @@ coder = Agent(
     role='Senior Python Developer',
     goal='Implement modular Flask code across multiple files.',
     backstory="""You write robust, decoupled Python. You return updates as 
-    file blocks starting with '--- FILE: path ---'. You never truncate existing 
-    logic and ensure imports are syntactically correct.""",
+    file blocks starting with '--- FILE: path ---'. You must define Blueprint 
+    objects (e.g., shortener_bp) at the very top of files before using decorators. 
+    You never truncate existing logic and ensure imports are syntactically correct.""",
     llm=openai_llm,
     verbose=True
 )
@@ -207,7 +210,8 @@ qa_auditor = Agent(
     goal='Verify the codebase update passes stability and security audits.',
     backstory="""You are the gatekeeper. You run the stability tester and 
     ensure all security guardrails (CSRF, ID filters) are maintained. 
-    You reject any code containing AI artifacts like '--- END FILE ---'.""",
+    You verify that blueprints are defined before use and reject any code 
+    containing AI artifacts like '--- END FILE ---'.""",
     llm=openai_llm,
     verbose=True,
     tools=[python_tester_tool]
@@ -227,7 +231,8 @@ def run_build_cycle(issue, current_index, total_tickets):
     blueprint_task = Task(
         description=(
             f"Requirements:\n{jira_requirements}\n\nExisting Codebase:\n{existing_codebase}\n\n"
-            "TASK: Create a SURGICAL Blueprint identifying specific module changes."
+            "TASK: Create a SURGICAL Blueprint. Identify which files need modification. "
+            "Ensure you account for Blueprint initialization order."
         ),
         expected_output="A technical specification for the modular update.",
         agent=architect
@@ -237,7 +242,8 @@ def run_build_cycle(issue, current_index, total_tickets):
         description=(
             "Implement the update using Blueprints. Return full content of modified files.\n"
             "Format: --- FILE: path/to/file.py ---\n[content]\n\n"
-            "MANDATORY: Do not include markers like '--- END FILE ---' inside the code content."
+            "MANDATORY:\n1. Define the Blueprint object at the top of the file.\n"
+            "2. Do not include markers like '--- END FILE ---' inside code blocks."
         ),
         expected_output="The complete codebase update with FILE markers.",
         agent=coder,
@@ -245,7 +251,7 @@ def run_build_cycle(issue, current_index, total_tickets):
     )
 
     audit_task = Task(
-        description="Run stability tests and verify security guardrails. Output ONLY the finalized code blocks.",
+        description="Run stability tests. Ensure NameErrors and ImportErrors are fixed. Output ONLY the finalized code blocks.",
         expected_output="The finalized modular codebase update.",
         agent=qa_auditor,
         context=[coding_task]
@@ -273,8 +279,8 @@ def run_build_cycle(issue, current_index, total_tickets):
             full_path = Path(PROJECT_ROOT) / file_path.strip()
             full_path.parent.mkdir(parents=True, exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
-                # Sanitization: Ensure no AI markers leaked into the final save
-                sanitized = content.replace("--- END FILE", "# END FILE").strip()
+                # Sanitization: Robust removal of all AI markers
+                sanitized = re.sub(r'--- (?:FILE|END FILE):? .*? ---', '', content).strip()
                 f.write(sanitized)
         
         # Mark as complete in Jira

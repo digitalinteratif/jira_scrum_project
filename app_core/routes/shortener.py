@@ -1,22 +1,21 @@
-try:
-    from flask import Blueprint, render_template_string, request
-except Exception:
-    raise
+from flask import Blueprint, render_template_string, request
 
-short_bp = Blueprint('short', __name__)
+# FIX: The variable name must be consistent with the decorators used below
+shortener_bp = Blueprint('shortener', __name__)
 
 @shortener_bp.route('/shorten', methods=['GET', 'POST'])
 def shorten():
     if request.method == 'POST':
-        url = request.form['url']
-        # create short code...
+        url = request.form.get('url')
+        # create short code logic here...
         return "shortened"
-    # Ensure CSRF hidden input is present in the inline form
+    
+    # UI Persistence: Hidden CSRF token is mandatory
     return render_template_string("""
         <html><body>
         <form method="post" action="/shorten">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <input name="url" />
+            <input name="url" placeholder="Enter URL" required />
             <input type="submit" value="Shorten" />
         </form>
         </body></html>
