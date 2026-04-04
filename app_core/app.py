@@ -50,6 +50,8 @@ def create_app():
     # --- 4. EXTENSIONS ---
     db.init_app(app)
     csrf.init_app(app)
+    # Talisman handles SSL and security headers. 
+    # CSP is None to allow Tailwind scripts to run from the CDN.
     Talisman(app, content_security_policy=None)
 
     # --- 5. UI PERSISTENCE (Global Layout) ---
@@ -70,51 +72,57 @@ def create_app():
                     <div class="container mx-auto flex justify-between items-center">
                         <a href="/" class="text-2xl font-black text-blue-600">URL.CO</a>
                         <div class="space-x-4">
-                            <a href="/login" class="text-sm">Log In</a>
-                            <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-bold">Get Started</a>
+                            <a href="/login" class="text-sm font-medium hover:text-blue-600">Log In</a>
+                            <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-bold hover:bg-blue-700 transition">Get Started</a>
                         </div>
                     </div>
                 </nav>
                 <main class="container mx-auto mt-12 px-4 max-w-5xl">
                     {content_body}
                 </main>
+                <footer class="mt-20 border-t p-10 text-center text-gray-400 text-xs uppercase tracking-widest">
+                    &copy; 2026 digitalinteractif.com
+                </footer>
             </body>
             </html>
             """
             return render_template_string(html_template)
         return dict(render_layout=render_layout)
 
-    # --- 6. ROOT ROUTE (Fixes the 404 on home page) ---
+    # --- 6. ROOT ROUTE ---
     @app.route('/')
     def index():
-        from flask import render_template_string
         # Use the global render_layout tool defined in context_processor
         content = """
         <div class="text-center py-20">
-            <h1 class="text-5xl font-extrabold mb-6">Simplify your links.</h1>
-            <p class="text-xl text-gray-600 mb-10">Professional URL shortening for digitalinteractif.com</p>
+            <h1 class="text-5xl font-extrabold mb-6 text-slate-800">Simplify your links.</h1>
+            <p class="text-xl text-slate-500 mb-10">Professional URL shortening and analytics for digitalinteractif.com</p>
             <div class="flex justify-center gap-4">
                 <a href="/register" class="bg-blue-600 text-white px-8 py-3 rounded-lg font-bold shadow-lg hover:bg-blue-700 transition">Create Free Account</a>
-                <a href="/login" class="bg-white border border-gray-300 px-8 py-3 rounded-lg font-bold hover:bg-gray-50 transition">Sign In</a>
+                <a href="/login" class="bg-white border border-slate-300 px-8 py-3 rounded-lg font-bold hover:bg-slate-50 transition">Sign In</a>
             </div>
         </div>
         """
-        # Get the render_layout function from the app context
-        render_layout = utility_processor()['render_layout']
-        return render_layout(content)
+        # Fetching the layout helper from the processor
+        layout_func = utility_processor()['render_layout']
+        return layout_func(content)
 
     # --- 7. MODULAR ROUTE REGISTRATION ---
+    # The 404s on /login and /register mean these blocks are failing.
+    # Check your Render logs for "CRITICAL FAIL" to see the specific error.
     try:
         from app_core.routes.auth import auth_bp
         app.register_blueprint(auth_bp)
+        app.logger.info("Successfully registered Auth Blueprint")
     except Exception as e:
-        app.logger.error(f"Auth Blueprint failed: {e}")
+        app.logger.error(f"CRITICAL FAIL: Auth Blueprint failed to load: {e}")
 
     try:
         from app_core.routes.shortener import shortener_bp
         app.register_blueprint(shortener_bp)
+        app.logger.info("Successfully registered Shortener Blueprint")
     except Exception as e:
-        app.logger.error(f"Shortener Blueprint failed: {e}")
+        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint failed to load: {e}")
 
     # --- 8. DATABASE INITIALIZATION ---
     with app.app_context():
@@ -125,6 +133,7 @@ def create_app():
 
     return app
 
+# The Gunicorn entry point
 app = create_app()
 
 if __name__ == "__main__":
