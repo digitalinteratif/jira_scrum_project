@@ -2,3 +2,4 @@
 build_kan*
 *.db
 trace*.txt
+build*.log
