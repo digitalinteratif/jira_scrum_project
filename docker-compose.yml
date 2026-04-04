@@ -1,24 +1,43 @@
 version: "3.8"
 
 services:
-  app:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: smartlink
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d smartlink || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kan151_staging_app:latest
-    container_name: kan151_staging_app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Point the app at the local Postgres instance to mirror production parity.
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/smartlink"
+      BASE_URL: "http://localhost:5000"
+      # Helpful dev flags (override in env as needed)
+      FLASK_ENV: development
+      # Ensure cookie secure flag derives from BASE_URL (app uses that logic)
     ports:
       - "5000:5000"
-    environment:
-      # Recommended: load app-specific envs from host .env via docker-compose --env-file .env (runbook shows usage)
-      # Minimal safe defaults for local staging if .env not provided
-      - FLASK_ENV=production
-      - DATABASE_URL=${DATABASE_URL:-sqlite:///shortener.db}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://localhost:5000/health || exit 1"]
-      interval: 2s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      interval: 5s
       timeout: 3s
-      retries: 20
-    restart: "no"
-    # Do not mount host volume by default to keep staging closer to image behavior.
-    # For very fast iterative dev, developers may mount code in local docker-compose.override.yml (optional).
+      start_period: 5s
+      retries: 12
+    restart: on-failure
+
+volumes:
+  db_data:
