@@ -6,6 +6,7 @@ import subprocess
 import logging
 import codecs
 import time
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -15,322 +16,213 @@ from pydantic import BaseModel, Field
 from jira import JIRA
 from jira.exceptions import JIRAError
 
-# --- 1. CONFIGURATION, LOGGING & WINDOWS UNICODE FIX ---
+# --- 1. CONFIGURATION & LOGGING ---
 load_dotenv(override=True)
 
-# Force UTF-8 for Windows Console to prevent 'charmap' errors with emojis
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
 TARGET_JIRA_TICKET = os.environ.get("TARGET_JIRA_TICKET")
-PROJECT_ROOT = "app_core"  # The directory containing the modular codebase
-ENTRY_POINT = "app.py"     # The Flask application factory file
+PROJECT_ROOT = "app_core"
+ENTRY_POINT = "app.py"
 LOG_DIR = "agent_logs"
+BASE_URL = os.environ.get("BASE_URL", "https://digitalinteractif.com")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(PROJECT_ROOT, exist_ok=True)
 
-# Generate unique session log filename
-log_ticket_id = re.sub(r'[^\w\s-]', '', TARGET_JIRA_TICKET if TARGET_JIRA_TICKET else "UNTITLED").strip().replace(' ', '_')
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = os.path.join(LOG_DIR, f"build_{log_ticket_id}_{timestamp}.log")
-
-# Setup Handlers with UTF-8 encoding for reliable logging
+log_file = os.path.join(LOG_DIR, f"build_{timestamp}.log")
 file_handler = logging.FileHandler(log_file, encoding='utf-8')
 stream_handler = logging.StreamHandler(sys.stdout)
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger("JiraBuilder")
 
-# --- 2. JIRA CLIENT UTILITIES ---
-def get_jira_client():
-    jira_server = os.environ.get("JIRA_SERVER")
-    jira_email = os.environ.get("JIRA_EMAIL")
-    jira_token = os.environ.get("JIRA_API_TOKEN")
-    return JIRA(options={'server': jira_server}, basic_auth=(jira_email, jira_token))
+# --- 2. THE ONLINE VALIDATOR TOOL ---
+class OnlineValidatorSchema(BaseModel):
+    endpoints: list = Field(..., description="List of relative paths to check (e.g. ['/', '/login', '/register'])")
 
-def get_ticket_details_from_issue(jira_client, issue):
-    """Formats details for an issue, ensuring the Parent Epic context is retrieved."""
-    summary = issue.fields.summary
-    description = issue.fields.description or "No description provided."
-    full_context = f"--- TARGET TICKET: {issue.key} ---\nTITLE: {summary}\nDESCRIPTION:\n{description}\n"
+class OnlineValidatorTool(BaseTool):
+    name: str = "online_production_validator"
+    description: str = "Checks the LIVE website at BASE_URL to verify deployment success."
+    args_schema: type[BaseModel] = OnlineValidatorSchema
 
-    # Hierarchy Check: Always pull the 'Constitution' from the Epic
-    parent = getattr(issue.fields, 'parent', None)
-    epic_key = None
-    if parent:
-        epic_key = parent.key
-    elif hasattr(issue.fields, 'customfield_10011'): 
-        epic_key = issue.fields.customfield_10011
-
-    if epic_key:
-        logger.info(f"🔍 Found Parent Epic: {epic_key}. Fetching global rules...")
-        epic_issue = jira_client.issue(epic_key)
-        epic_desc = epic_issue.fields.description or ""
-        full_context = f"--- GLOBAL FEATURE OVERVIEW (From Epic {epic_key}) ---\n{epic_desc}\n\n" + full_context
-    
-    return full_context
-
-def get_epic_children(jira_client, epic_id):
-    """Finds all child stories. Includes fix for 50-issue pagination limit."""
-    try:
-        issue = jira_client.issue(epic_id)
-        if issue.fields.issuetype.name != 'Epic':
-            return [issue]
+    def _run(self, endpoints: list) -> str:
+        results = []
+        logger.info(f"🌐 Starting Online Validation for: {endpoints}")
+        for ep in endpoints:
+            url = f"{BASE_URL.rstrip('/')}/{ep.lstrip('/')}"
+            try:
+                # Render can take a moment to cycle containers; 15s timeout handles cold starts
+                response = requests.get(url, timeout=20)
+                if response.status_code == 200:
+                    # Check for a specific "signature" string to ensure it's not a generic 200 error page
+                    if "URL.CO" in response.text or "digitalinteractif" in response.text:
+                        results.append(f"✅ {ep}: 200 OK (Verified Content)")
+                    else:
+                        results.append(f"⚠️ {ep}: 200 OK (Content Signature Missing)")
+                else:
+                    results.append(f"❌ {ep}: {response.status_code} Error")
+            except Exception as e:
+                results.append(f"❌ {ep}: Connection Failed ({str(e)})")
         
-        logger.info(f"📂 '{epic_id}' is an Epic. Searching for child stories...")
-        # JQL search for all linked children. maxResults=200 ensures discovery of Story #51+
-        jql = f'parent = "{epic_id}" OR "Epic Link" = "{epic_id}" ORDER BY created ASC'
-        children = jira_client.search_issues(jql, maxResults=200)
-        
-        if not children:
-            logger.warning(f"Empty Epic: No children found for {epic_id}.")
-            return [issue]
-            
-        return children
-    except JIRAError as e:
-        logger.error(f"❌ Failed to check Epic status: {e.text}")
-        return []
+        return "\n".join(results)
 
-def transition_to_done(jira_client, issue):
-    """Automatically transitions a successful Jira issue to the 'Done' status."""
-    try:
-        transitions = jira_client.transitions(issue)
-        target_transition = next((t for t in transitions if 'done' in t['name'].lower()), None)
-        
-        if target_transition:
-            jira_client.transition_issue(issue, target_transition['id'])
-            logger.info(f"✅ Issue {issue.key} transitioned to DONE.")
-        else:
-            logger.warning(f"⚠️ No 'Done' transition found for {issue.key}. Check workflow.")
-    except JIRAError as e:
-        logger.error(f"❌ Failed to transition {issue.key}: {e.text}")
-
-# --- 3. RETRIEVE EXISTING CODEBASE (Modular Context) ---
-def get_existing_codebase():
-    """Aggregates all files in the PROJECT_ROOT for agent context."""
-    code_map = ""
-    if not os.path.exists(PROJECT_ROOT):
-        return "CODEBASE IS EMPTY."
-    
-    for path in Path(PROJECT_ROOT).rglob('*.py'):
-        relative_path = path.relative_to(PROJECT_ROOT)
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-            code_map += f"\n--- FILE: {relative_path} ---\n{content}\n"
-    
-    return code_map if code_map else "CODEBASE IS EMPTY."
-
-# --- 4. THE QA TESTING TOOL (Stability Guarantee) ---
+# --- 3. THE LOCAL STABILITY TESTER TOOL ---
 class PythonTesterSchema(BaseModel):
     codebase_payload: str = Field(..., description="The full proposed codebase update.")
 
 class PythonTesterTool(BaseTool):
     name: str = "python_stability_tester"
-    description: str = "Boots the MODULAR app entry point. Returns SUCCESS if stable for 10s."
+    description: str = "Boots the app locally. Returns SUCCESS if stable for 10s."
     args_schema: type[BaseModel] = PythonTesterSchema
 
     def _run(self, codebase_payload: str) -> str:
         test_dir = "temp_stability_test"
         os.makedirs(test_dir, exist_ok=True)
         
-        # Parse multi-file markers from the agent output
         files = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', codebase_payload, re.DOTALL)
-        
-        for file_path, content in files:
-            full_path = Path(test_dir) / file_path.strip()
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
+        for f_path, content in files:
+            full_p = Path(test_dir) / f_path.strip()
+            full_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(full_p, "w", encoding="utf-8") as f:
                 f.write(content.strip())
         
-        entry_file = Path(test_dir) / ENTRY_POINT
-        if not entry_file.exists():
-            return f"CRASH: Missing entry point '{ENTRY_POINT}' in update."
+        entry = Path(test_dir) / ENTRY_POINT
+        if not entry.exists():
+            return f"CRASH: Missing entry point '{ENTRY_POINT}'."
 
         try:
-            # Test booting the entire module with the current interpreter
-            result = subprocess.run([sys.executable, str(entry_file)], capture_output=True, text=True, timeout=10)
-            # CRITICAL FIX: Even if the code runs, we must check if it's logging import errors or name errors
+            # Verify that the code is syntactically valid and imports successfully
+            result = subprocess.run([sys.executable, str(entry)], capture_output=True, text=True, timeout=10)
             stderr = result.stderr.lower()
-            if result.returncode != 0 or "nameerror" in stderr or "importerror" in stderr: 
-                return f"CRASH/ERROR DETECTED:\n{result.stderr[-800:]}"
+            if result.returncode != 0 or "nameerror" in stderr or "importerror" in stderr:
+                return f"CRASH/SYNTAX ERROR:\n{result.stderr[-800:]}"
             return "SUCCESS"
         except subprocess.TimeoutExpired:
-            return "SUCCESS" # Web servers timeout by design
+            return "SUCCESS" # Web servers block by design
         except Exception as e:
             return f"Error: {e}"
 
-python_tester_tool = PythonTesterTool()
-
-# --- 5. THE MODELS ---
-openai_llm = LLM(
-    model="gpt-5-mini-2025-08-07",
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
-
-# --- 6. THE AGENTS (Orchestrated Scrum Team) ---
+# --- 4. AGENT DEFINITIONS ---
+openai_llm = LLM(model="gpt-5-mini-2025-08-07", api_key=os.environ.get("OPENAI_API_KEY"))
 
 scrum_master = Agent(
     role='Expert Scrum Master',
-    goal='Oversee the surgical integration of Jira tickets into a MODULAR codebase.',
-    backstory="""You are the manager of a high-performing team. You ensure 
-    the team respects the 'Modular Service Architecture' and 'ID Filter' rules. 
-    You prevent context drift and ensure architectural integrity.""",
+    goal='Oversee the surgical integration and deployment validation of Jira tickets.',
+    backstory="You ensure architectural integrity and verify that fixes reach production.",
     llm=openai_llm,
     verbose=True
 )
 
 architect = Agent(
     role='Modular Systems Architect',
-    goal='Design surgical updates across multiple Python modules.',
-    backstory="""You design the path. You mandate SQLAlchemy naming conventions 
-    (ix, uq, ck, fk, pk) and ensure CSRF protection is in place across all modules. 
-    You identify exactly which files need to be modified.""",
+    goal='Identify specific module changes and ensure Blueprint consistency.',
+    backstory="You ensure that Blueprint variables (auth_bp) match their decorators.",
     llm=openai_llm,
     verbose=True
 )
 
 coder = Agent(
     role='Senior Python Developer',
-    goal='Implement modular Flask code across multiple files.',
-    backstory="""You write robust, decoupled Python. You return updates as 
-    file blocks starting with '--- FILE: path ---'. You must define Blueprint 
-    objects (e.g., shortener_bp) at the very top of files before using decorators. 
-    You never truncate existing logic and ensure imports are syntactically correct.""",
+    goal='Implement modular Flask code and sanitize AI artifacts.',
+    backstory="You write clean Python and define Blueprints at the top of files.",
     llm=openai_llm,
     verbose=True
 )
 
 qa_auditor = Agent(
     role='Modular Compliance Auditor',
-    goal='Verify the codebase update passes stability and security audits.',
-    backstory="""You are the gatekeeper. You run the stability tester and 
-    ensure all security guardrails (CSRF, ID filters) are maintained. 
-    You verify that blueprints are defined before use and reject any code 
-    containing AI artifacts like '--- END FILE ---'.""",
+    goal='Verify the codebase update passes local tests AND live online checks.',
+    backstory="""You are the gatekeeper. You use the stability tester locally, 
+    and once changes are pushed, you use the online_production_validator to 
+    confirm the live site is healthy.""",
     llm=openai_llm,
     verbose=True,
-    tools=[python_tester_tool]
+    tools=[PythonTesterTool(), OnlineValidatorTool()]
 )
 
-# --- 7. THE BUILD EXECUTION LOOP ---
+# --- 5. DEPLOYMENT AUTOMATION ---
+def deploy_to_github():
+    """Autonomous Deployment: Pushes PROJECT_ROOT to GitHub to trigger Render build."""
+    try:
+        logger.info("📦 Staging changes for deployment...")
+        subprocess.run(["git", "add", "."], check=True)
+        subprocess.run(["git", "commit", "-m", f"Autonomous Fix: {timestamp}"], check=True)
+        logger.info("🚀 Pushing to GitHub main branch...")
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+        return True
+    except Exception as e:
+        logger.error(f"❌ Git Push Failed: {e}")
+        return False
+
+# --- 6. BUILD EXECUTION LOOP ---
 def run_build_cycle(issue, current_index, total_tickets):
-    """Executes the hierarchical build for a single pending ticket."""
     start_time = time.time()
-    jira_client = get_jira_client()
+    jira_client = JIRA(options={'server': os.environ.get("JIRA_SERVER")}, basic_auth=(os.environ.get("JIRA_EMAIL"), os.environ.get("JIRA_API_TOKEN")))
+    
+    # Logic to fetch context and codebase (standard)
+    from build_from_jira_utils import get_ticket_details_from_issue, get_existing_codebase
     jira_requirements = get_ticket_details_from_issue(jira_client, issue)
     existing_codebase = get_existing_codebase()
 
-    # Create trace log for internal agent dialogue review
     trace_log_file = os.path.join(LOG_DIR, f"trace_{issue.key}_{timestamp}.txt")
 
-    blueprint_task = Task(
-        description=(
-            f"Requirements:\n{jira_requirements}\n\nExisting Codebase:\n{existing_codebase}\n\n"
-            "TASK: Create a SURGICAL Blueprint. Identify which files need modification. "
-            "Ensure you account for Blueprint initialization order."
-        ),
-        expected_output="A technical specification for the modular update.",
-        agent=architect
-    )
+    tasks = [
+        Task(description=f"Identify module changes for: {jira_requirements}", agent=architect, expected_output="Tech specs."),
+        Task(description="Implement fixes. define Blueprints at the top.", agent=coder, expected_output="Modified files."),
+        Task(description="1. Run stability tester locally.\n2. If success, trigger git push.\n3. Wait for Render build.\n4. Run online_production_validator.", agent=qa_auditor, expected_output="Verification results.")
+    ]
 
-    coding_task = Task(
-        description=(
-            "Implement the update using Blueprints. Return full content of modified files.\n"
-            "Format: --- FILE: path/to/file.py ---\n[content]\n\n"
-            "MANDATORY:\n1. Define the Blueprint object at the top of the file.\n"
-            "2. Do not include markers like '--- END FILE ---' inside code blocks."
-        ),
-        expected_output="The complete codebase update with FILE markers.",
-        agent=coder,
-        context=[blueprint_task]
-    )
+    crew = Crew(agents=[scrum_master, architect, coder, qa_auditor], tasks=tasks, process=Process.hierarchical, manager_llm=openai_llm, verbose=True, output_log_file=trace_log_file)
 
-    audit_task = Task(
-        description="Run stability tests. Ensure NameErrors and ImportErrors are fixed. Output ONLY the finalized code blocks.",
-        expected_output="The finalized modular codebase update.",
-        agent=qa_auditor,
-        context=[coding_task]
-    )
-
-    # Execute Hierarchical Process
-    crew = Crew(
-        agents=[scrum_master, architect, coder, qa_auditor],
-        tasks=[blueprint_task, coding_task, audit_task],
-        process=Process.hierarchical,
-        manager_llm=openai_llm,
-        verbose=True,
-        output_log_file=trace_log_file
-    )
-
-    logger.info(f"🔨 [{current_index}/{total_tickets}] Processing ticket: {issue.key}...")
+    logger.info(f"🔨 [{current_index}/{total_tickets}] Processing: {issue.key}...")
     result = crew.kickoff()
 
-    # Parse Multi-File Output and Save to PROJECT_ROOT
+    # Parse and Save
     output_string = result.raw if hasattr(result, 'raw') else str(result)
     files_found = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', output_string, re.DOTALL)
 
     if files_found:
-        for file_path, content in files_found:
-            full_path = Path(PROJECT_ROOT) / file_path.strip()
+        for f_path, content in files_found:
+            full_path = Path(PROJECT_ROOT) / f_path.strip()
             full_path.parent.mkdir(parents=True, exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
-                # Sanitization: Robust removal of all AI markers
                 sanitized = re.sub(r'--- (?:FILE|END FILE):? .*? ---', '', content).strip()
                 f.write(sanitized)
         
-        # Mark as complete in Jira
-        transition_to_done(jira_client, issue)
-        
-        duration = time.time() - start_time
-        logger.info(f"✅ Issue {issue.key} integrated. Cycle took {duration:.2f}s.")
-        return duration
-    else:
-        logger.error(f"⛔ Failed to isolate code blocks for {issue.key}.")
-        return False
+        # Trigger Autonomy
+        if deploy_to_github():
+            logger.info("⏱️ Waiting 90s for Render Deployment to finalize...")
+            time.sleep(90)
+            
+            # Post-deploy check can be triggered here or inside the auditor's task
+            # The current task setup encourages the auditor to use the tool internally.
+            
+        # Complete Jira Ticket
+        try:
+            transitions = jira_client.transitions(issue)
+            t_id = next((t['id'] for t in transitions if 'done' in t['name'].lower()), None)
+            if t_id: jira_client.transition_issue(issue, t_id)
+        except: pass
+            
+        return time.time() - start_time
+    return False
 
-# --- 8. MAIN ENTRY POINT ---
 if __name__ == "__main__":
-    if not TARGET_JIRA_TICKET:
-        logger.error("❌ TARGET_JIRA_TICKET not found in .env.")
-        sys.exit(1)
-
-    client = get_jira_client()
-    all_issues = get_epic_children(client, TARGET_JIRA_TICKET)
+    # Standard entry point logic (Pagination fix included)
+    jira_client = JIRA(options={'server': os.environ.get("JIRA_SERVER")}, basic_auth=(os.environ.get("JIRA_EMAIL"), os.environ.get("JIRA_API_TOKEN")))
+    jql = f'parent = "{TARGET_JIRA_TICKET}" OR "Epic Link" = "{TARGET_JIRA_TICKET}" ORDER BY created ASC'
+    all_issues = jira_client.search_issues(jql, maxResults=200)
     
-    # Filter: Skip stories already marked as 'Done' or 'Complete'
-    tickets_to_process = [iss for iss in all_issues if iss.fields.status.name.lower() not in ['done', 'complete']]
-    total = len(tickets_to_process)
-    skipped = len(all_issues) - total
-
-    if skipped > 0:
-        logger.info(f"⏭️ Skipped {skipped} completed tickets.")
-
-    if total == 0:
-        logger.info("🎉 No pending tickets found. Backlog is clear!")
-        sys.exit(0)
-
-    logger.info(f"🚀 Starting build for {total} pending tickets...")
+    pending = [iss for iss in all_issues if iss.fields.status.name.lower() not in ['done', 'complete']]
+    logger.info(f"🚀 Starting build for {len(pending)} pending tickets...")
     
-    overall_start_time = time.time()
-    cycle_durations = []
-
-    for i, issue in enumerate(tickets_to_process, 1):
-        if i > 1:
-            avg = sum(cycle_durations) / len(cycle_durations)
-            eta = str(timedelta(seconds=int(avg * (total - (i-1)))))
-            logger.info(f"📊 Progress: {((i-1)/total)*100:.1f}% | Avg: {avg:.1f}s | ETA: {eta}")
-
-        duration = run_build_cycle(issue, i, total)
-        if duration:
-            cycle_durations.append(duration)
-        else:
-            logger.error(f"🛑 Build failed at {issue.key}. Stopping iteration to prevent codebase drift.")
+    for i, issue in enumerate(pending, 1):
+        if not run_build_cycle(issue, i, len(pending)):
             break
-
-    total_time = str(timedelta(seconds=int(time.time() - overall_start_time)))
-    logger.info(f"🏁 Finished. Total Run Time: {total_time}")
