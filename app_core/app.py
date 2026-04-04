@@ -84,7 +84,26 @@ def create_app():
             return render_template_string(html_template)
         return dict(render_layout=render_layout)
 
-    # --- 6. MODULAR ROUTE REGISTRATION ---
+    # --- 6. ROOT ROUTE (Fixes the 404 on home page) ---
+    @app.route('/')
+    def index():
+        from flask import render_template_string
+        # Use the global render_layout tool defined in context_processor
+        content = """
+        <div class="text-center py-20">
+            <h1 class="text-5xl font-extrabold mb-6">Simplify your links.</h1>
+            <p class="text-xl text-gray-600 mb-10">Professional URL shortening for digitalinteractif.com</p>
+            <div class="flex justify-center gap-4">
+                <a href="/register" class="bg-blue-600 text-white px-8 py-3 rounded-lg font-bold shadow-lg hover:bg-blue-700 transition">Create Free Account</a>
+                <a href="/login" class="bg-white border border-gray-300 px-8 py-3 rounded-lg font-bold hover:bg-gray-50 transition">Sign In</a>
+            </div>
+        </div>
+        """
+        # Get the render_layout function from the app context
+        render_layout = utility_processor()['render_layout']
+        return render_layout(content)
+
+    # --- 7. MODULAR ROUTE REGISTRATION ---
     try:
         from app_core.routes.auth import auth_bp
         app.register_blueprint(auth_bp)
@@ -97,7 +116,7 @@ def create_app():
     except Exception as e:
         app.logger.error(f"Shortener Blueprint failed: {e}")
 
-    # --- 7. DATABASE INITIALIZATION ---
+    # --- 8. DATABASE INITIALIZATION ---
     with app.app_context():
         try:
             db.create_all()
