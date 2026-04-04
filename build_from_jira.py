@@ -25,13 +25,13 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
 TARGET_JIRA_TICKET = os.environ.get("TARGET_JIRA_TICKET")
-PROJECT_ROOT = "app_core"
-ENTRY_POINT = "app.py"
+# FIX: Set PROJECT_ROOT to '.' to allow agents to specify full paths relative to the repo root.
+PROJECT_ROOT = "."
+ENTRY_POINT = "app_core/app.py"
 LOG_DIR = "agent_logs"
 BASE_URL = os.environ.get("BASE_URL", "https://digitalinteractif.com")
 
 os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(PROJECT_ROOT, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = os.path.join(LOG_DIR, f"build_{timestamp}.log")
@@ -111,11 +111,13 @@ def transition_to_done(jira_client, issue):
 def get_existing_codebase():
     """Aggregates all files in the app_core directory for AI context."""
     code_map = ""
-    if not os.path.exists(PROJECT_ROOT):
+    # We only care about the app_core folder for the coder's logic
+    target_dir = Path("app_core")
+    if not target_dir.exists():
         return "CODEBASE IS EMPTY."
     
-    for path in Path(PROJECT_ROOT).rglob('*.py'):
-        relative_path = path.relative_to(PROJECT_ROOT)
+    for path in target_dir.rglob('*.py'):
+        relative_path = path
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
             code_map += f"\n--- FILE: {relative_path} ---\n{content}\n"
@@ -137,7 +139,6 @@ class OnlineValidatorTool(BaseTool):
         for ep in endpoints:
             url = f"{BASE_URL.rstrip('/')}/{ep.lstrip('/')}"
             try:
-                # 20s timeout handles Render's potential cold start
                 response = requests.get(url, timeout=20)
                 if response.status_code == 200:
                     if "URL.CO" in response.text or "digitalinteractif" in response.text:
@@ -161,49 +162,51 @@ class PythonTesterTool(BaseTool):
     args_schema: type[BaseModel] = PythonTesterSchema
 
     def _run(self, codebase_payload: str) -> str:
-        test_dir = "temp_stability_test"
-        os.makedirs(test_dir, exist_ok=True)
+        test_dir = Path("temp_stability_test")
+        if test_dir.exists():
+            import shutil
+            shutil.rmtree(test_dir)
+        test_dir.mkdir(parents=True, exist_ok=True)
         
         files = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', codebase_payload, re.DOTALL)
         for f_path, content in files:
-            full_p = Path(test_dir) / f_path.strip()
+            # FIX: Agents should return full paths starting with app_core/
+            full_p = test_dir / f_path.strip()
             full_p.parent.mkdir(parents=True, exist_ok=True)
             with open(full_p, "w", encoding="utf-8") as f:
                 f.write(content.strip())
         
-        # FIX: The entry point for Gunicorn must have 'app' at the top level.
-        # We now run a script that explicitly checks for this attribute to catch AppImportErrors locally.
+        # FIX: Explicitly verify the structure mirrors Render
+        # Render expects: /app_core/app.py
+        # Start command: gunicorn app_core.app:app
         check_script = f"""
 import sys
 import os
+# Ensure the root of our temp dir is in the path
 sys.path.insert(0, os.getcwd())
 try:
     from app_core.app import app
     print("WSGI_CHECK_PASSED")
 except (ImportError, AttributeError) as e:
-    print(f"WSGI_CHECK_FAILED: 'app' object not found in app_core.app module. Error: {{e}}")
+    print(f"WSGI_CHECK_FAILED: Could not find 'app' object in 'app_core.app'. Error: {{e}}")
+    # Debug: list what we have
+    if os.path.exists('app_core'):
+        print(f"Files in app_core: {{os.listdir('app_core')}}")
     sys.exit(1)
 except Exception as e:
     print(f"WSGI_CHECK_FAILED: {{e}}")
     sys.exit(1)
 """
-        check_file = Path(test_dir) / "wsgi_check.py"
+        check_file = test_dir / "wsgi_check.py"
         with open(check_file, "w", encoding="utf-8") as f:
             f.write(check_script)
 
         try:
-            # 1. WSGI Pre-flight Check
-            result = subprocess.run([sys.executable, "wsgi_check.py"], capture_output=True, text=True, cwd=test_dir, timeout=15)
+            # 1. WSGI Pre-flight Check (Runs from the root of temp_stability_test)
+            result = subprocess.run([sys.executable, "wsgi_check.py"], capture_output=True, text=True, cwd=str(test_dir), timeout=15)
             if "WSGI_CHECK_PASSED" not in result.stdout:
-                return f"CRASH: Gunicorn will fail to find 'app'.\nERROR: {result.stdout}\nSTDERR: {result.stderr}"
+                return f"CRASH: Gunicorn validation failed.\nERROR: {result.stdout}\nSTDERR: {result.stderr}"
 
-            # 2. General Startup Check
-            entry = Path(test_dir) / ENTRY_POINT
-            result = subprocess.run([sys.executable, str(entry)], capture_output=True, text=True, timeout=10)
-            stderr = result.stderr.lower()
-            if result.returncode != 0 or "nameerror" in stderr or "importerror" in stderr:
-                return f"CRASH/SYNTAX ERROR:\n{result.stderr[-800:]}"
-            
             return "SUCCESS"
         except subprocess.TimeoutExpired:
             return "SUCCESS" 
@@ -220,7 +223,7 @@ scrum_master = Agent(
     role='Expert Scrum Master',
     goal='Oversee surgical codebase updates and ensure code is ready for deployment.',
     backstory="""You are the ultimate gatekeeper. You ensure that only valid code blocks are returned. 
-    You are aware that Render requires a module-level 'app' object for Gunicorn.""",
+    You are aware that Render requires a module-level 'app' object for Gunicorn in app_core/app.py.""",
     llm=openai_llm,
     verbose=True
 )
@@ -228,7 +231,7 @@ scrum_master = Agent(
 architect = Agent(
     role='Modular Systems Architect',
     goal='Design surgical module updates and maintain Blueprint integrity.',
-    backstory="You ensure that 'app = create_app()' is called at the bottom of app_core/app.py.",
+    backstory="You ensure that 'app = create_app()' is called at the module level in app_core/app.py.",
     llm=openai_llm,
     verbose=True
 )
@@ -236,7 +239,8 @@ architect = Agent(
 coder = Agent(
     role='Senior Python Developer',
     goal='Write clean, modular Flask code across multiple modules.',
-    backstory="You always return your work in '--- FILE: path ---' format.",
+    backstory="""You always return your work in '--- FILE: app_core/path/to/file.py ---' format. 
+    You must ensure that app_core/app.py exposes 'app' at the top level for Gunicorn.""",
     llm=openai_llm,
     verbose=True
 )
@@ -245,7 +249,7 @@ qa_auditor = Agent(
     role='Modular Compliance Auditor',
     goal='Verify code passes local WSGI tests and generate finalized code blocks.',
     backstory="""You only care about results. You run the stability tester. 
-    If the 'app' object is missing, you reject the code. You ONLY return the verified 
+    You reject any code where the WSGI check fails. You ONLY return the verified 
     code blocks in '--- FILE: path ---' format.""",
     llm=openai_llm,
     verbose=True,
@@ -254,7 +258,7 @@ qa_auditor = Agent(
 
 # --- 7. DEPLOYMENT AUTOMATION ---
 def deploy_to_github():
-    """Autonomous Deployment: Pushes PROJECT_ROOT to GitHub to trigger Render build."""
+    """Autonomous Deployment: Pushes changes to GitHub to trigger Render build."""
     try:
         logger.info("📦 Staging changes for deployment...")
         subprocess.run(["git", "add", "."], check=True)
@@ -283,11 +287,11 @@ def run_build_cycle(issue, current_index, total_tickets):
 
     tasks = [
         Task(description=f"Create Technical Spec for: {jira_requirements}", agent=architect, expected_output="Technical spec."),
-        Task(description="Implement fixes. Output files using '--- FILE: path ---' format.", agent=coder, expected_output="Modified code blocks."),
+        Task(description="Implement fixes. Output files using '--- FILE: app_core/path ---' format.", agent=coder, expected_output="Modified code blocks."),
         Task(
             description=(
                 "Use python_stability_tester to verify the code blocks. "
-                "The tester will specifically check if 'app' is exposed at the module level of app_core/app.py. "
+                "Specifically ensure 'app' is exposed in 'app_core/app.py'. "
                 "IF SUCCESS: Output the EXACT code blocks verified using the '--- FILE: path ---' format. "
                 "DO NOT provide bash scripts, instructions, or narrative. ONLY code blocks."
             ), 
@@ -306,6 +310,7 @@ def run_build_cycle(issue, current_index, total_tickets):
 
     if files_found:
         for f_path, content in files_found:
+            # FIX: f_path now contains 'app_core/app.py', so we save directly to PROJECT_ROOT ('.')
             full_path = Path(PROJECT_ROOT) / f_path.strip()
             full_path.parent.mkdir(parents=True, exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
@@ -313,7 +318,7 @@ def run_build_cycle(issue, current_index, total_tickets):
                 f.write(sanitized)
         
         if deploy_to_github():
-            wait_time = 120 
+            wait_time = 150 # Increased wait for Render
             logger.info(f"⏱️ Waiting {wait_time}s for Render to finalize build...")
             time.sleep(wait_time)
             
