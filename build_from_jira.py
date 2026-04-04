@@ -124,7 +124,6 @@ def get_existing_codebase():
 
 # --- 4. THE ONLINE VALIDATOR TOOL ---
 class OnlineValidatorSchema(BaseModel):
-    # FIX: Changed 'list' to 'List[str]' for explicit schema generation
     endpoints: List[str] = Field(..., description="List of relative paths to check (e.g. ['/', '/login', '/register'])")
 
 class OnlineValidatorTool(BaseTool):
@@ -141,7 +140,6 @@ class OnlineValidatorTool(BaseTool):
                 # 20s timeout handles Render's potential cold start
                 response = requests.get(url, timeout=20)
                 if response.status_code == 200:
-                    # Verified content check prevents generic success pages from passing
                     if "URL.CO" in response.text or "digitalinteractif" in response.text:
                         results.append(f"✅ {ep}: 200 OK (Verified Content)")
                     else:
@@ -159,7 +157,7 @@ class PythonTesterSchema(BaseModel):
 
 class PythonTesterTool(BaseTool):
     name: str = "python_stability_tester"
-    description: str = "Boots the app locally. Returns SUCCESS if stable for 10s."
+    description: str = "Boots the app locally and verifies WSGI 'app' attribute exists."
     args_schema: type[BaseModel] = PythonTesterSchema
 
     def _run(self, codebase_payload: str) -> str:
@@ -173,18 +171,42 @@ class PythonTesterTool(BaseTool):
             with open(full_p, "w", encoding="utf-8") as f:
                 f.write(content.strip())
         
-        entry = Path(test_dir) / ENTRY_POINT
-        if not entry.exists():
-            return f"CRASH: Missing entry point '{ENTRY_POINT}'."
+        # FIX: The entry point for Gunicorn must have 'app' at the top level.
+        # We now run a script that explicitly checks for this attribute to catch AppImportErrors locally.
+        check_script = f"""
+import sys
+import os
+sys.path.insert(0, os.getcwd())
+try:
+    from app_core.app import app
+    print("WSGI_CHECK_PASSED")
+except (ImportError, AttributeError) as e:
+    print(f"WSGI_CHECK_FAILED: 'app' object not found in app_core.app module. Error: {{e}}")
+    sys.exit(1)
+except Exception as e:
+    print(f"WSGI_CHECK_FAILED: {{e}}")
+    sys.exit(1)
+"""
+        check_file = Path(test_dir) / "wsgi_check.py"
+        with open(check_file, "w", encoding="utf-8") as f:
+            f.write(check_script)
 
         try:
+            # 1. WSGI Pre-flight Check
+            result = subprocess.run([sys.executable, "wsgi_check.py"], capture_output=True, text=True, cwd=test_dir, timeout=15)
+            if "WSGI_CHECK_PASSED" not in result.stdout:
+                return f"CRASH: Gunicorn will fail to find 'app'.\nERROR: {result.stdout}\nSTDERR: {result.stderr}"
+
+            # 2. General Startup Check
+            entry = Path(test_dir) / ENTRY_POINT
             result = subprocess.run([sys.executable, str(entry)], capture_output=True, text=True, timeout=10)
             stderr = result.stderr.lower()
             if result.returncode != 0 or "nameerror" in stderr or "importerror" in stderr:
                 return f"CRASH/SYNTAX ERROR:\n{result.stderr[-800:]}"
+            
             return "SUCCESS"
         except subprocess.TimeoutExpired:
-            return "SUCCESS" # Web server is running
+            return "SUCCESS" 
         except Exception as e:
             return f"Error: {e}"
 
@@ -197,7 +219,8 @@ openai_llm = LLM(model="gpt-5-mini-2025-08-07", api_key=os.environ.get("OPENAI_A
 scrum_master = Agent(
     role='Expert Scrum Master',
     goal='Oversee surgical codebase updates and ensure code is ready for deployment.',
-    backstory="You are the ultimate gatekeeper. You ensure that only valid code blocks are returned.",
+    backstory="""You are the ultimate gatekeeper. You ensure that only valid code blocks are returned. 
+    You are aware that Render requires a module-level 'app' object for Gunicorn.""",
     llm=openai_llm,
     verbose=True
 )
@@ -205,7 +228,7 @@ scrum_master = Agent(
 architect = Agent(
     role='Modular Systems Architect',
     goal='Design surgical module updates and maintain Blueprint integrity.',
-    backstory="You ensure that Blueprint variables match their decorator names exactly.",
+    backstory="You ensure that 'app = create_app()' is called at the bottom of app_core/app.py.",
     llm=openai_llm,
     verbose=True
 )
@@ -220,9 +243,9 @@ coder = Agent(
 
 qa_auditor = Agent(
     role='Modular Compliance Auditor',
-    goal='Verify code passes local stability tests and generate finalized code blocks.',
+    goal='Verify code passes local WSGI tests and generate finalized code blocks.',
     backstory="""You only care about results. You run the stability tester. 
-    You never provide narrative text or bash scripts; you ONLY return the verified 
+    If the 'app' object is missing, you reject the code. You ONLY return the verified 
     code blocks in '--- FILE: path ---' format.""",
     llm=openai_llm,
     verbose=True,
@@ -235,7 +258,6 @@ def deploy_to_github():
     try:
         logger.info("📦 Staging changes for deployment...")
         subprocess.run(["git", "add", "."], check=True)
-        # Check if there are actually changes to commit
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout
         if not status:
             logger.info("No changes to commit.")
@@ -265,6 +287,7 @@ def run_build_cycle(issue, current_index, total_tickets):
         Task(
             description=(
                 "Use python_stability_tester to verify the code blocks. "
+                "The tester will specifically check if 'app' is exposed at the module level of app_core/app.py. "
                 "IF SUCCESS: Output the EXACT code blocks verified using the '--- FILE: path ---' format. "
                 "DO NOT provide bash scripts, instructions, or narrative. ONLY code blocks."
             ), 
@@ -278,7 +301,6 @@ def run_build_cycle(issue, current_index, total_tickets):
     logger.info(f"🔨 [{current_index}/{total_tickets}] Processing: {issue.key}...")
     result = crew.kickoff()
 
-    # Parse and Save
     output_string = result.raw if hasattr(result, 'raw') else str(result)
     files_found = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', output_string, re.DOTALL)
 
@@ -290,13 +312,11 @@ def run_build_cycle(issue, current_index, total_tickets):
                 sanitized = re.sub(r'--- (?:FILE|END FILE):? .*? ---', '', content).strip()
                 f.write(sanitized)
         
-        # Trigger Deployment & Wait
         if deploy_to_github():
-            wait_time = 120 # Seconds
+            wait_time = 120 
             logger.info(f"⏱️ Waiting {wait_time}s for Render to finalize build...")
             time.sleep(wait_time)
             
-            # Post-Deployment Online Validation Pass
             logger.info("🔍 Running Online Production Validation...")
             validation_crew = Crew(
                 agents=[qa_auditor],
@@ -305,7 +325,6 @@ def run_build_cycle(issue, current_index, total_tickets):
             )
             validation_crew.kickoff()
             
-        # Complete Jira Ticket
         transition_to_done(jira_client, issue)
             
         return time.time() - start_time
