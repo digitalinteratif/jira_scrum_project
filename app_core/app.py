@@ -1,7 +1,7 @@
 import os
 import logging
 import traceback
-from flask import Flask, render_template_string, jsonify
+from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from flask_talisman import Talisman
@@ -29,7 +29,6 @@ def create_app():
 
     # --- 2. DATABASE PATH RESILIENCY ---
     db_url = os.environ.get("DATABASE_URL", "sqlite:///shortener.db")
-    
     if db_url.startswith("sqlite:////data/"):
         if not os.path.exists("/data"):
             app.logger.warning("Storage disk /data not found. Falling back to local sqlite.")
@@ -51,86 +50,30 @@ def create_app():
     csrf.init_app(app)
     Talisman(app, content_security_policy=None)
 
-    # --- 5. UI PERSISTENCE (Global Layout) ---
-    @app.context_processor
-    def utility_processor():
-        def render_layout(content_body):
-            html_template = f"""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>URL Shortener | digitalinteractif.com</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-            </head>
-            <body class="bg-slate-50 text-slate-900 font-sans">
-                <nav class="bg-white border-b border-slate-200 p-4 shadow-sm">
-                    <div class="container mx-auto flex justify-between items-center">
-                        <a href="/" class="text-2xl font-black text-blue-600">URL.CO</a>
-                        <div class="space-x-4">
-                            <a href="/login" class="text-sm hover:text-blue-600">Log In</a>
-                            <a href="/register" class="bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-bold hover:bg-blue-700 transition">Get Started</a>
-                        </div>
-                    </div>
-                </nav>
-                <main class="container mx-auto mt-12 px-4 max-w-5xl">
-                    {content_body}
-                </main>
-                <footer class="mt-20 border-t p-10 text-center text-gray-400 text-xs uppercase tracking-widest">
-                    &copy; 2026 digitalinteractif.com
-                </footer>
-            </body>
-            </html>
-            """
-            return render_template_string(html_template)
-        return dict(render_layout=render_layout)
+    # --- 5. MODULAR ROUTE REGISTRATION ---
+    # We now use a 'home' blueprint to fix the 'home.index' build errors
+    try:
+        from app_core.routes.home import home_bp
+        app.register_blueprint(home_bp)
+        app.logger.info("SUCCESS: Home Blueprint registered.")
+    except Exception:
+        app.logger.error(f"CRITICAL FAIL: Home Blueprint failed.\n{traceback.format_exc()}")
 
-    # --- 6. ROOT ROUTE ---
-    @app.route('/')
-    def index():
-        content = """
-        <div class="text-center py-20">
-            <h1 class="text-5xl font-extrabold mb-6 text-slate-800">Simplify your links.</h1>
-            <p class="text-xl text-slate-500 mb-10">Professional URL shortening and analytics for digitalinteractif.com</p>
-            <div class="flex justify-center gap-4">
-                <a href="/register" class="bg-blue-600 text-white px-8 py-3 rounded-lg font-bold shadow-lg hover:bg-blue-700 transition">Create Free Account</a>
-                <a href="/login" class="bg-white border border-slate-300 px-8 py-3 rounded-lg font-bold hover:bg-slate-50 transition">Sign In</a>
-            </div>
-        </div>
-        """
-        layout_func = utility_processor()['render_layout']
-        return layout_func(content)
-
-    # --- 7. DEBUG ROUTE (Helpful to see what is loaded) ---
-    @app.route('/debug-routes')
-    def list_routes():
-        import urllib
-        output = []
-        for rule in app.url_map.iter_rules():
-            methods = ','.join(rule.methods)
-            line = urllib.parse.unquote(f"{rule.endpoint:50s} {methods:20s} {rule}")
-            output.append(line)
-        return "<pre>" + "\n".join(output) + "</pre>"
-
-    # --- 8. MODULAR ROUTE REGISTRATION ---
-    # These blocks are likely failing due to syntax errors in auth.py and shortener.py.
-    # The traceback.format_exc() will print the EXACT line of the error to Render logs.
     try:
         from app_core.routes.auth import auth_bp
         app.register_blueprint(auth_bp)
         app.logger.info("SUCCESS: Auth Blueprint registered.")
-    except Exception as e:
-        app.logger.error(f"CRITICAL FAIL: Auth Blueprint could not be registered.\n{traceback.format_exc()}")
+    except Exception:
+        app.logger.error(f"CRITICAL FAIL: Auth Blueprint failed.\n{traceback.format_exc()}")
 
     try:
         from app_core.routes.shortener import shortener_bp
         app.register_blueprint(shortener_bp)
         app.logger.info("SUCCESS: Shortener Blueprint registered.")
-    except Exception as e:
-        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint could not be registered.\n{traceback.format_exc()}")
+    except Exception:
+        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint failed.\n{traceback.format_exc()}")
 
-    # --- 9. DATABASE INITIALIZATION ---
+    # --- 6. DATABASE INITIALIZATION ---
     with app.app_context():
         try:
             db.create_all()
