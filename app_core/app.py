@@ -53,51 +53,41 @@ def create_app():
     Talisman(app, content_security_policy=None, force_https=force_https)
 
     # --- 5. MODULAR ROUTE REGISTRATION ---
+    # We must fail-fast on blueprint import/registration errors per project guardrails.
+    # Do not swallow exceptions here: surface them so CI and developers see the root cause.
     try:
         from app_core.routes.home import home_bp
         app.register_blueprint(home_bp)
         app.logger.info("SUCCESS: Home Blueprint registered.")
-    except Exception:
-        app.logger.error(f"CRITICAL FAIL: Home Blueprint failed.\n{traceback.format_exc()}")
-        # Architectural Memory trace for easier CI/RCAs
-        try:
-            with open("trace_KAN-154.txt", "a") as _f:
-                _f.write(f"HOME_BLUEPRINT_IMPORT_FAILED\n{traceback.format_exc()}\n")
-        except Exception:
-            pass
+    except Exception as e:
+        # Log full traceback then re-raise so create_app fails fast.
+        app.logger.error("CRITICAL FAIL: Home Blueprint failed to import/register.\n%s", traceback.format_exc())
+        raise
 
     try:
         from app_core.routes.auth import auth_bp
         app.register_blueprint(auth_bp)
         app.logger.info("SUCCESS: Auth Blueprint registered.")
-    except Exception:
-        app.logger.error(f"CRITICAL FAIL: Auth Blueprint failed.\n{traceback.format_exc()}")
-        # Architectural Memory trace for easier CI/RCAs
-        try:
-            with open("trace_KAN-154.txt", "a") as _f:
-                _f.write(f"AUTH_BLUEPRINT_IMPORT_FAILED\n{traceback.format_exc()}\n")
-        except Exception:
-            pass
+    except Exception as e:
+        app.logger.error("CRITICAL FAIL: Auth Blueprint failed to import/register.\n%s", traceback.format_exc())
+        raise
 
     try:
         from app_core.routes.shortener import shortener_bp
         app.register_blueprint(shortener_bp)
         app.logger.info("SUCCESS: Shortener Blueprint registered.")
-    except Exception:
-        app.logger.error(f"CRITICAL FAIL: Shortener Blueprint failed.\n{traceback.format_exc()}")
-        # Architectural Memory trace for easier CI/RCAs
-        try:
-            with open("trace_KAN-154.txt", "a") as _f:
-                _f.write(f"SHORTENER_BLUEPRINT_IMPORT_FAILED\n{traceback.format_exc()}\n")
-        except Exception:
-            pass
+    except Exception as e:
+        app.logger.error("CRITICAL FAIL: Shortener Blueprint failed to import/register.\n%s", traceback.format_exc())
+        raise
 
     # --- 6. DATABASE INITIALIZATION ---
     with app.app_context():
         try:
             db.create_all()
         except Exception as e:
-            app.logger.error(f"Database creation failed: {e}")
+            # Database initialization errors are fatal during app bootstrap; surface them.
+            app.logger.error("Database creation failed during app startup.\n%s", traceback.format_exc())
+            raise
 
     return app
 
