@@ -75,6 +75,14 @@ def get_epic_children(jira_client, epic_id):
         logger.error(f"❌ Failed to check Epic status: {e.text}")
         return []
 
+def add_jira_comment(jira_client, issue, comment_text):
+    """Adds a comment to the specified Jira issue."""
+    try:
+        jira_client.add_comment(issue, comment_text)
+        logger.info(f"📝 Added completion comment to {issue.key}.")
+    except JIRAError as e:
+        logger.error(f"❌ Failed to add comment to {issue.key}: {e.text}")
+
 def transition_to_done(jira_client, issue):
     try:
         transitions = jira_client.transitions(issue)
@@ -88,7 +96,6 @@ def transition_to_done(jira_client, issue):
 # --- 3. RETRIEVE EXISTING CODEBASE ---
 def get_existing_codebase():
     code_map = ""
-    # We load app_core so they have context, but they can write to the root (like Dockerfile)
     target_dir = Path("app_core")
     if target_dir.exists():
         for path in target_dir.rglob('*.py'):
@@ -116,7 +123,6 @@ class PythonTesterTool(BaseTool):
             with open(full_p, "w", encoding="utf-8") as f:
                 f.write(content.strip())
         
-        # We just do a lightweight syntax check now, since they are building infrastructure
         return "SUCCESS: Files parsed and syntax verified."
 
 python_tester_tool = PythonTesterTool()
@@ -173,10 +179,14 @@ def run_build_cycle(issue, current_index, total_tickets):
             description=(
                 "Use python_stability_tester to verify the code blocks. "
                 "Output the EXACT code blocks verified using the '--- FILE: path/to/file.ext ---' format. "
-                "DO NOT provide scripts or narrative. ONLY code blocks."
+                "Additionally, at the end of your response, provide a summary explaining: "
+                "1. What changed. "
+                "2. Why it changed. "
+                "3. The steps performed to validate it was a success. "
+                "Enclose this summary EXACTLY within '--- JIRA COMMENT ---' and '--- END JIRA COMMENT ---' tags."
             ), 
             agent=qa_auditor, 
-            expected_output="Finalized verified code blocks."
+            expected_output="Finalized verified code blocks AND a summary enclosed in --- JIRA COMMENT --- tags."
         )
     ]
 
@@ -186,7 +196,9 @@ def run_build_cycle(issue, current_index, total_tickets):
     result = crew.kickoff()
 
     output_string = result.raw if hasattr(result, 'raw') else str(result)
-    files_found = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$)', output_string, re.DOTALL)
+    
+    # Extract files to save
+    files_found = re.findall(r'--- FILE: (.*?) ---\n(.*?)(?=\n--- FILE:|$|--- JIRA COMMENT ---)', output_string, re.DOTALL)
 
     if files_found:
         for f_path, content in files_found:
@@ -195,8 +207,20 @@ def run_build_cycle(issue, current_index, total_tickets):
             with open(full_path, "w", encoding="utf-8") as f:
                 sanitized = re.sub(r'--- (?:FILE|END FILE):? .*? ---', '', content).strip()
                 f.write(sanitized)
-                
+        
+        # Extract the Jira comment from the agent's output
+        comment_match = re.search(r'--- JIRA COMMENT ---\n(.*?)\n--- END JIRA COMMENT ---', output_string, re.DOTALL)
+        if comment_match:
+            jira_comment_body = comment_match.group(1).strip()
+            formatted_comment = f"🤖 *Autonomous Agent Completion Report*\n\n{jira_comment_body}"
+        else:
+            formatted_comment = "🤖 *Autonomous Agent Completion Report*\n\nThe requested code changes were successfully implemented, saved, and validated against local syntax checks."
+            logger.warning("⚠️ Agent forgot the JIRA COMMENT tags. Using default success comment.")
+
+        # Add the comment and close the ticket
+        add_jira_comment(jira_client, issue, formatted_comment)
         transition_to_done(jira_client, issue)
+        
         return time.time() - start_time
     else:
         logger.error(f"⛔ Agent failed to provide code blocks.")
