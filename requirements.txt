@@ -1,20 +1,33 @@
+# --- AI & Automation ---
 crewai>=1.13.0
 langchain>=0.1.0
-pydantic>=2.0.0
 openai>=1.0.0
+jira>=3.10.0
+pydantic>=2.0.0
+requests>=2.31.0
+
+# --- Web Framework & Server ---
 flask>=3.1.0
-flask-sqlalchemy>=3.1.0
 werkzeug>=3.0.0
 gunicorn>=21.0.0
+
+# --- Database ---
 sqlalchemy>=2.0.0
-jira>=3.10.0
+flask-sqlalchemy>=3.1.0
+psycopg2-binary>=2.9.9
+
+# --- Security & Auth ---
 argon2-cffi>=21.0.0
 pyjwt>=2.12.1
-python-dotenv>=1.0.0
-redis>=4.0.0
 flask-talisman>=1.1.0
 flask-wtf>=1.2.2
 flask_login>=0.6.0
 flask_limiter>=2.0.0
+
+# --- Utils & Caching ---
+python-dotenv>=1.0.0
 redis>=4.0.0
-argon2-cffi>=21.0.0
+
+# --- QA & Testing ---
+pytest-playwright>=0.4.0
+playwright>=1.42.0

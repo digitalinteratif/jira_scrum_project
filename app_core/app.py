@@ -48,7 +48,9 @@ def create_app():
     # --- 4. EXTENSIONS ---
     db.init_app(app)
     csrf.init_app(app)
-    Talisman(app, content_security_policy=None)
+    # Disable forced HTTPS in local Docker environment
+    force_https = os.environ.get("FLASK_ENV") != "development"
+    Talisman(app, content_security_policy=None, force_https=force_https)
 
     # --- 5. MODULAR ROUTE REGISTRATION ---
     try:

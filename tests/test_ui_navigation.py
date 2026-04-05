@@ -4,7 +4,7 @@ import pytest
 # This test suite uses pytest-playwright fixtures (the `page` fixture).
 # It performs simple navigation checks against a local running instance (http://localhost:5000 by default).
 
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:5000")
+BASE_URL = "http://localhost:5000" # os.environ.get("BASE_URL", "http://localhost:5000")
 
 @pytest.mark.order(1)
 def test_root_loads(page):
