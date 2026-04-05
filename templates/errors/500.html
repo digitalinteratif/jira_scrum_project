@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Server Error</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:#fff;color:#111;margin:0;padding:2rem}
+    .container{max-width:760px;margin:0 auto;padding:1.5rem;background:#fff;border-radius:8px}
+    .alert{color:#b00020;margin-bottom:1rem}
+    a.button{display:inline-block;padding:.5rem 1rem;background:#0b63d8;color:#fff;border-radius:6px;text-decoration:none}
+    .support{margin-top:.75rem;color:#444}
+  </style>
+</head>
+<body>
+  <main class="container" id="main-content" tabindex="-1">
+    <h1>Something went wrong</h1>
+    <p class="alert" role="alert" aria-live="assertive">{{ message }}</p>
+
+    <p class="support">We're sorry — an unexpected error occurred on our side. Our engineers have been notified. Please try again later.</p>
+
+    <p style="margin-top:1rem">
+      <a class="button" href="/">Home</a>
+      <a style="margin-left:.6rem" href="javascript:location.reload()">Retry</a>
+    </p>
+  </main>
+</body>
+</html>

@@ -57,6 +57,13 @@ except Exception:
     _bucket_manager = None
     _persist_to_db = None
 
+# short code service for generation/allocation (SQLAlchemy path supported)
+try:
+    from app_core import short_code_service
+    ShortCodeGenerationError = short_code_service.ShortCodeGenerationError
+except Exception:
+    short_code_service = None
+    ShortCodeGenerationError = Exception
 
 def _build_rate_limit_headers(capacity: float, remaining: float, reset_ts: int):
     try:
@@ -368,84 +375,112 @@ def api_shorten():
             _trace(f"API_SHORTEN_CREATED api_key_id={api_key.id} user_id={user_id} short_id={new_short.id} slug={new_short.slug}")
             return resp
 
-        # Auto-generated slug path: use deterministic option if provided by payload (not required by spec)
-        # Use models.create_shorturl via an atomic reservation callback is the most robust approach.
-        # For simplicity here, try find a unique slug by using a simple generate/reserve loop via models.create_shorturl.
-        # We'll use a conservative approach: try a few randomized attempts
-        from utils.shortener import generate_slug, UniqueSlugGenerationError  # defensive import
-
-        attempt = 0
-        max_attempts = 8
+        # Auto-generated slug path: use centralized allocation via short_code_service when available
         created = None
-        last_err = None
-        while attempt < max_attempts and created is None:
-            cand = None
-            # Deterministic hint: if client requested 'deterministic' flag use hashed source
-            if data.get("deterministic"):
-                # Use HMAC-like deterministic slug if utils.shortener supports it; else fallback to generate_slug without deterministic_source
+        try:
+            if short_code_service is not None:
                 try:
-                    cand = generate_slug(length=8, deterministic_source=normalized_target, secret=current_app.config.get("JWT_SECRET", ""))
-                except Exception:
-                    cand = generate_slug(length=8)
+                    # Use SQLAlchemy insertion path via short_code_service which returns a models.ShortURL
+                    created = short_code_service.allocate_short_code_and_insert(session, normalized_target, owner_user_id=user_id)
+                    # created is expected to be a models.ShortURL instance
+                except ShortCodeGenerationError:
+                    # After retries, generator failed
+                    suggestions = []
+                    try:
+                        suggestions = suggest_alternatives("link", count=5, session=session)
+                    except Exception:
+                        suggestions = []
+                    resp = make_response(jsonify({"error": "slug_generation_failed", "detail": "unable to generate unique slug", "suggestions": suggestions}), 500)
+                    for k, v in rl_headers.items():
+                        resp.headers[k] = v
+                    _trace(f"API_SHORTEN_GENERATION_FAILED api_key_id={api_key.id} user_id={user_id} attempts={getattr(_, 'attempts', 'unknown')}")
+                    return resp
             else:
-                cand = generate_slug(length=8)
+                # Fallback to previous generator/insert loop using models.create_shorturl
+                from utils.shortener import generate_slug, UniqueSlugGenerationError  # defensive import
 
-            try:
-                created = models.create_shorturl(session, user_id=user_id, target_url=normalized_target, slug=cand, is_custom=False, expire_at=expire_at)
-                break
-            except models.DuplicateSlugError as e:
-                last_err = e
-                attempt += 1
-                continue
-            except Exception as e:
-                # DB or unexpected error -> abort
-                try:
-                    session.rollback()
-                except Exception:
-                    pass
-                resp = make_response(jsonify({"error": "db_error", "detail": str(e)}), 500)
+                attempt = 0
+                max_attempts = 8
+                created = None
+                last_err = None
+                while attempt < max_attempts and created is None:
+                    attempt += 1
+                    cand = None
+                    if data.get("deterministic"):
+                        try:
+                            cand = generate_slug(length=8, deterministic_source=normalized_target, secret=current_app.config.get("JWT_SECRET", ""))
+                        except Exception:
+                            cand = generate_slug(length=8)
+                    else:
+                        cand = generate_slug(length=8)
+                    try:
+                        created = models.create_shorturl(session, user_id=user_id, target_url=normalized_target, slug=cand, is_custom=False, expire_at=expire_at)
+                        break
+                    except models.DuplicateSlugError as e:
+                        last_err = e
+                        continue
+                    except Exception as e:
+                        try:
+                            session.rollback()
+                        except Exception:
+                            pass
+                        resp = make_response(jsonify({"error": "db_error", "detail": str(e)}), 500)
+                        for k, v in rl_headers.items():
+                            resp.headers[k] = v
+                        _trace(f"API_SHORTEN_DB_ERROR_CAND api_key_id={api_key.id} user_id={user_id} err={str(e)}")
+                        return resp
+
+                if created is None:
+                    suggestions = []
+                    try:
+                        suggestions = suggest_alternatives("link", count=5, session=session)
+                    except Exception:
+                        suggestions = []
+                    resp = make_response(jsonify({"error": "slug_generation_failed", "detail": "unable to generate unique slug", "suggestions": suggestions}), 500)
+                    for k, v in rl_headers.items():
+                        resp.headers[k] = v
+                    _trace(f"API_SHORTEN_GENERATION_FAILED api_key_id={api_key.id} user_id={user_id} attempts={attempt} last_err={last_err}")
+                    return resp
+
+            # Success: created contains the new ShortURL (models.ShortURL)
+            if created is None:
+                resp = make_response(jsonify({"error": "server_error", "detail": "creation failed"}), 500)
                 for k, v in rl_headers.items():
                     resp.headers[k] = v
-                _trace(f"API_SHORTEN_DB_ERROR_CAND api_key_id={api_key.id} user_id={user_id} err={str(e)}")
                 return resp
 
-        if created is None:
-            # After retries, return helpful message and suggestions
-            suggestions = []
-            try:
-                suggestions = suggest_alternatives("link", count=5, session=session)
-            except Exception:
-                suggestions = []
-            resp = make_response(jsonify({"error": "slug_generation_failed", "detail": "unable to generate unique slug", "suggestions": suggestions}), 500)
+            # created may be a models.ShortURL instance
+            new_short = created if hasattr(created, "slug") else None
+
+            custom_host = _get_user_verified_custom_host(session, user_id)
+            if custom_host and new_short:
+                scheme = current_app.config.get("CUSTOM_DOMAIN_DEFAULT_SCHEME", "https")
+                short_path = f"{scheme}://{custom_host}/{new_short.slug}"
+            else:
+                try:
+                    host_url = request.url_root.rstrip("/")
+                    short_path = f"{host_url}/{new_short.slug if new_short else created}"
+                except Exception:
+                    short_path = (new_short.slug if new_short else (created if isinstance(created, str) else ""))
+
+            body = {
+                "id": new_short.id if new_short else None,
+                "slug": new_short.slug if new_short else (created if isinstance(created, str) else None),
+                "short_url": short_path,
+                "target_url": new_short.target_url if new_short else normalized_target,
+            }
+            resp = make_response(jsonify(body), 201)
             for k, v in rl_headers.items():
                 resp.headers[k] = v
-            _trace(f"API_SHORTEN_GENERATION_FAILED api_key_id={api_key.id} user_id={user_id} attempts={attempt} last_err={str(last_err)}")
+            _trace(f"API_SHORTEN_CREATED_AUTO api_key_id={api_key.id} user_id={user_id} short_id={body.get('id')} slug={body.get('slug')}")
             return resp
-
-        # Success: created contains the new ShortURL
-        custom_host = _get_user_verified_custom_host(session, user_id)
-        if custom_host:
-            scheme = current_app.config.get("CUSTOM_DOMAIN_DEFAULT_SCHEME", "https")
-            short_path = f"{scheme}://{custom_host}/{created.slug}"
-        else:
+        finally:
             try:
-                host_url = request.url_root.rstrip("/")
-                short_path = f"{host_url}/{created.slug}"
+                session.close()
             except Exception:
-                short_path = created.slug
-
-        body = {
-            "id": created.id,
-            "slug": created.slug,
-            "short_url": short_path,
-            "target_url": created.target_url,
-        }
-        resp = make_response(jsonify(body), 201)
-        for k, v in rl_headers.items():
-            resp.headers[k] = v
-        _trace(f"API_SHORTEN_CREATED_AUTO api_key_id={api_key.id} user_id={user_id} short_id={created.id} slug={created.slug}")
-        return resp
+                pass
     finally:
+        # Ensure session closed in outermost finally (already attempted above); keep defensive
         try:
             session.close()
         except Exception:
@@ -456,4 +491,3 @@ def api_shorten():
 # - No HTML responses are returned; JSON only.
 # - CSRF is not required for JSON programmatic endpoints (API keys serve auth).
 # - The decorator writes trace_KAN-145.txt entries for auth/limit/create events per Architectural Memory mandate.
-# --- END FILE ---

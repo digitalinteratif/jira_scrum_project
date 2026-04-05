@@ -128,7 +128,7 @@ class PythonTesterTool(BaseTool):
 python_tester_tool = PythonTesterTool()
 
 # --- 5. AGENT DEFINITIONS ---
-openai_llm = LLM(model="gpt-5-mini-2025-08-07", api_key=os.environ.get("OPENAI_API_KEY"))
+openai_llm = LLM(model="gpt-5.1-codex-mini", api_key=os.environ.get("OPENAI_API_KEY"))
 
 scrum_master = Agent(
     role='Expert Scrum Master',

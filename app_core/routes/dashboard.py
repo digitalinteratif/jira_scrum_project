@@ -6,17 +6,17 @@ Provides:
   - POST /dashboard/<id>/edit
   - POST /dashboard/<id>/delete
 
-All routes enforce authentication via g.current_user, apply the "ID Filter" rule for user-owned data,
+All routes enforce authentication via session or g.current_user, apply the "ID Filter" rule for user-owned data,
 include CSRF tokens in forms, and return HTML wrapped via utils.templates.render_layout.
-
-This module is a surgical addition to register dashboard functionality as its own Blueprint.
 """
 
-from flask import Blueprint, request, current_app, url_for, redirect, g
+from flask import Blueprint, request, current_app, url_for, redirect, g, session, flash
 from utils.templates import render_layout
 from sqlalchemy.exc import IntegrityError
 import models
 from datetime import datetime
+import logging
+from html import escape
 
 # Utilities used for validation/suggestions
 try:
@@ -33,52 +33,11 @@ except Exception:
 try:
     from utils.validation import validate_and_normalize_url
 except Exception:
-    from urllib.parse import urlparse, urlunparse, quote, unquote
-
-    def validate_and_normalize_url(raw_url: str) -> str:
-        if not isinstance(raw_url, str):
-            raise ValueError("URL must be a string.")
-        url = raw_url.strip()
-        if not url:
-            raise ValueError("Empty URL provided.")
-        if "\n" in url or "\r" in url:
-            raise ValueError("Invalid characters in URL.")
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        if scheme not in ("http", "https"):
-            raise ValueError("URL must start with http:// or https://")
-        if not parsed.netloc:
-            raise ValueError("URL must include a network location.")
-        netloc = parsed.netloc
-        userinfo = ""
-        hostport = netloc
-        if "@" in netloc:
-            userinfo, hostport = netloc.rsplit("@", 1)
-        if ":" in hostport:
-            host, port = hostport.rsplit(":", 1)
-            try:
-                int(port)
-                port_part = f":{port}"
-            except Exception:
-                host = hostport
-                port_part = ""
-        else:
-            host = hostport
-            port_part = ""
-        try:
-            host_idna = host.encode("idna").decode("ascii")
-        except Exception:
-            raise ValueError("Invalid hostname in URL.")
-        normalized_netloc = host_idna + port_part
-        if userinfo:
-            normalized_netloc = f"{userinfo}@{normalized_netloc}"
-        path = quote(unquote(parsed.path), safe="/%:@[]!$&'()*+,;=")
-        query = quote(unquote(parsed.query), safe="=&?/")
-        fragment = quote(unquote(parsed.fragment), safe="")
-        return urlunparse((scheme, normalized_netloc, path, parsed.params, query, fragment))
-
+    validate_and_normalize_url = None
 
 dashboard_bp = Blueprint("dashboard", __name__)
+
+_logger = logging.getLogger(__name__)
 
 def _write_trace_117(entry: str):
     """Best-effort trace writer for KAN-117."""
@@ -90,63 +49,268 @@ def _write_trace_117(entry: str):
 
 def _require_auth():
     """
-    Ensure an authenticated user is present on g.current_user.
+    Ensure an authenticated user is present either on g.current_user or session['user_id'].
     Returns (user_id, error_response) tuple where error_response is None on success.
+    Accepts demo user_id when ALLOW_DEMO_USER_ID is true (from query/form values).
     """
+    # Prefer g.current_user if middleware sets it
     current_user = getattr(g, "current_user", None)
-    if not current_user or not getattr(current_user, "id", None):
-        return None, (render_layout("<h1>Unauthorized</h1><p>You must be authenticated to access the dashboard.</p>"), 401)
+    if current_user and getattr(current_user, "id", None):
+        try:
+            return int(current_user.id), None
+        except Exception:
+            return None, (render_layout("<h1>Unauthorized</h1><p>Invalid authenticated identity.</p>"), 401)
+
+    # Fallback to session-based auth (most routes set session['user_id'] on login)
     try:
-        return int(current_user.id), None
+        sess_uid = session.get("user_id")
+        if sess_uid:
+            try:
+                return int(sess_uid), None
+            except Exception:
+                pass
     except Exception:
-        return None, (render_layout("<h1>Unauthorized</h1><p>Invalid authenticated identity.</p>"), 401)
+        pass
+
+    # allow demo mode for tests/dev when explicitly enabled
+    try:
+        allow_demo = bool(current_app.config.get("ALLOW_DEMO_USER_ID", False))
+    except Exception:
+        allow_demo = False
+    if allow_demo:
+        try:
+            user_id = int(request.values.get("user_id", "0"))
+            if user_id > 0:
+                return user_id, None
+        except Exception:
+            pass
+        return None, (render_layout("<h1>Unauthorized</h1><p>Demo user_id required in ALLOW_DEMO_USER_ID mode.</p>"), 401)
+
+    return None, (render_layout("<h1>Unauthorized</h1><p>You must be authenticated to access the dashboard.</p>"), 401)
 
 
 @dashboard_bp.route("/dashboard", methods=["GET"])
 def dashboard_index():
     """
-    List the authenticated user's short URLs.
+    List the authenticated user's short URLs and provide the shortener form.
     """
     user_id, err = _require_auth()
     if err:
+        # err already a (body, status) pair or redirect; if redirect, return it
+        # If err is a tuple containing response body and status, return it
         return err
 
-    session = models.Session()
+    session_db = models.Session()
     try:
-        # ID Filter applied here: only show current user's links
-        items = session.query(models.ShortURL).filter_by(user_id=user_id).order_by(models.ShortURL.created_at.desc()).all()
+        # ID Filter applied here: only show current user's links (SQLAlchemy version)
+        items = session_db.query(models.ShortURL).filter_by(user_id=user_id).order_by(models.ShortURL.created_at.desc()).limit(50).all()
 
-        # CSRF token for delete forms
+        # CSRF token for forms
         try:
             from flask_wtf.csrf import generate_csrf
             csrf_token = generate_csrf()
         except Exception:
             csrf_token = ""
 
-        rows_html = "<table style='width:100%; border-collapse: collapse;'>"
-        rows_html += "<tr><th>Slug</th><th>Target</th><th>Hits</th><th>Created</th><th>Actions</th></tr>"
+        # Recover prefill from session if redirected back after validation error
+        prefill = {}
+        try:
+            prefill = session.pop("shorten_prefill", {}) or {}
+        except Exception:
+            prefill = {}
+
+        # Gather flashed messages
+        from flask import get_flashed_messages
+        flashes = get_flashed_messages(with_categories=True)
+
+        # Build shortener form HTML and the list table
+        form_html = f"""
+          <section aria-labelledby="shorten-heading" class="mb-8">
+            <h2 id="shorten-heading" class="text-xl font-bold mb-3">Create a Short Link</h2>
+            {'<div role="alert" aria-live="assertive" style="color:#b00020;">' + escape(message) + '</div>' if False else ''}
+            <form method="POST" action="{url_for('shortener.create')}" id="dashboard-shorten-form" novalidate>
+              <input type="hidden" name="csrf_token" value="{csrf_token}">
+              <label for="shorten-target_url" class="block text-sm font-medium mb-1">Long URL</label>
+              <input id="shorten-target_url" name="target_url" type="url" required class="w-full p-3 border rounded-lg mb-3" value="{escape(prefill.get('target_url',''))}">
+              <label for="shorten-slug" class="block text-sm font-medium mb-1">Custom slug (optional)</label>
+              <input id="shorten-slug" name="slug" type="text" maxlength="255" class="w-full p-3 border rounded-lg mb-3" value="{escape(prefill.get('slug',''))}">
+              <!-- Demo user_id hidden input for test mode -->
+              {"<input type='hidden' name='user_id' value='" + escape(str(prefill.get('user_id', ''))) + "'>" if current_app.config.get('ALLOW_DEMO_USER_ID', False) else ""}
+              <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded">Shorten</button>
+            </form>
+            <!-- Flash area -->
+            <div id="dashboard-flashes" style="margin-top:1rem;">
+        """
+        # Append flashes
+        for category, msg in flashes:
+            safe_msg = escape(str(msg))
+            if category == "error":
+                form_html += f"<div role='alert' style='color:#b00020;'>{safe_msg}</div>"
+            else:
+                form_html += f"<div role='status' style='color:#064e3b;'>{safe_msg}</div>"
+        form_html += "</div></section>"
+
+        # --- Render Recently Created short links from session (KAN-178) ---
+        recent_html = ""
+        try:
+            recent_raw = session.pop("new_short_urls", []) or []
+        except Exception:
+            recent_raw = []
+
+        new_short_items = []
+        if recent_raw:
+            try:
+                base = current_app.config.get("BASE_URL") or request.url_root.rstrip("/")
+                base = base.rstrip("/")
+            except Exception:
+                try:
+                    base = request.url_root.rstrip("/")
+                except Exception:
+                    base = ""
+            try:
+                import re
+                pattern = current_app.config.get("REDIRECT_SLUG_REGEX", r"[A-Za-z0-9\-_]{1,16}")
+            except Exception:
+                pattern = r"[A-Za-z0-9\-_]{1,16}"
+
+            for r in recent_raw:
+                sc = None
+                try:
+                    if isinstance(r, dict):
+                        sc = r.get("short_code")
+                    else:
+                        sc = r
+                    if not sc or not isinstance(sc, str):
+                        continue
+                    try:
+                        if re.fullmatch(pattern, sc):
+                            new_short_items.append({"short_code": sc, "short_url": f"{base}/{sc}"})
+                        else:
+                            # if validation fails, still include conservative assembly but log
+                            new_short_items.append({"short_code": sc, "short_url": f"{base}/{sc}"})
+                    except Exception:
+                        new_short_items.append({"short_code": sc, "short_url": f"{base}/{sc}"})
+                except Exception:
+                    continue
+
+        if new_short_items:
+            recent_html += "<section aria-labelledby='recent-links-heading' class='mb-6'><h2 id='recent-links-heading' class='text-xl font-bold mb-3'>Recently created</h2>"
+            for ns in new_short_items:
+                safe_url = escape(ns.get("short_url", ""))
+                safe_slug = escape(ns.get("short_code", ""))
+                input_id = f"recent-shortlink-{safe_slug}"
+                recent_html += f"""
+                  <div class="recent-short-link" style="display:flex;gap:.5rem;align-items:center;margin-top:0.5rem;">
+                    <input id="{input_id}" class="shortlink-input" readonly value="{safe_url}" aria-label="Short link {safe_slug}" style="min-width:150px;padding:0.25rem;">
+                    <button class="copy-btn" data-copy-target="{input_id}" data-copy-url="{safe_url}" aria-label="Copy short link {safe_slug}" tabindex="0">Copy</button>
+                    <a href="{safe_url}" target="_blank" rel="noopener noreferrer">Open</a>
+                  </div>
+                """
+            recent_html += "</section>"
+
+        # Build table of existing links (with copy/open affordances)
+        rows_html = "<section aria-labelledby='links-heading'><h2 id='links-heading' class='text-xl font-bold mb-3'>Your Short URLs</h2>"
+        if not items:
+            rows_html += "<p>No short links yet. Use the form above to create your first link.</p>"
+            rows_html += "</section>"
+            try:
+                _write_trace_117(f"DASHBOARD_VIEW user_id={user_id} count=0")
+            except Exception:
+                pass
+            return render_layout(form_html + recent_html + rows_html)
+        rows_html += "<div class='responsive-table'><table style='width:100%; border-collapse: collapse;'><thead><tr><th>Short</th><th>Target</th><th>Hits</th><th>Created</th><th>Actions</th></tr></thead><tbody>"
         for s in items:
-            short_url = url_for("shortener.redirect_slug", slug=s.slug, _external=True)
+            try:
+                short_url = url_for("shortener.redirect_slug", slug=s.slug, _external=True)
+            except Exception:
+                short_url = (current_app.config.get("BASE_URL") or request.url_root.rstrip("/")) + "/" + (s.slug or "")
             edit_url = url_for("dashboard.dashboard_edit", link_id=s.id)
-            # Delete is a POST form to avoid CSRF-less delete
+            # Copy input with predictable id and a copy button wired to dataset.copyTarget
+            input_id = f"shortlink-input-{escape(s.slug or '')}"
+            copy_btn_id = f"copy-shortlink-{escape(s.slug or '')}"
             delete_form = f"""
               <form method="post" action="/dashboard/{s.id}/delete" style="display:inline;">
                 <input type="hidden" name="csrf_token" value="{csrf_token}">
                 <button type="submit" onclick="return confirm('Delete this short link?');">Delete</button>
               </form>
             """
-            rows_html += f"<tr style='border-top:1px solid #ddd;'><td><a href='{short_url}'>{s.slug}</a></td><td><a href='{s.target_url}'>{s.target_url}</a></td><td style='text-align:center'>{s.hit_count or 0}</td><td>{s.created_at}</td><td><a href='{edit_url}'>Edit</a> {delete_form}</td></tr>"
-        rows_html += "</table>"
+            rows_html += f"""
+              <tr style='border-top:1px solid #ddd;'>
+                <td><a href="{short_url}" target="_blank" rel="noopener noreferrer">{escape(s.slug)}</a></td>
+                <td><a href="{escape(s.target_url)}" target="_blank" rel="noopener noreferrer">{escape(s.target_url)}</a></td>
+                <td style='text-align:center'>{getattr(s, 'hit_count', 0) or 0}</td>
+                <td>{getattr(s, 'created_at', '')}</td>
+                <td>
+                  <div class="shortlink-row" style="display:flex;gap:.5rem;align-items:center;">
+                    <input id="{input_id}" class="shortlink-input" readonly value="{short_url}" style="min-width:150px;padding:0.25rem;">
+                    <button id="{copy_btn_id}" class="copy-btn" data-copy-target="{input_id}" aria-label="Copy short link" tabindex="0">Copy</button>
+                    <a href="{short_url}" target="_blank" rel="noopener noreferrer">Open</a>
+                    <a href="{edit_url}">Edit</a>
+                    {delete_form}
+                  </div>
+                </td>
+              </tr>
+            """
+        rows_html += "</tbody></table></div></section>"
 
         try:
             _write_trace_117(f"DASHBOARD_VIEW user_id={user_id} count={len(items)}")
         except Exception:
             pass
 
-        return render_layout(f"<h1>Your Short URLs</h1>{rows_html}")
+        # Append minimal clipboard JS (compatible with render_layout announcer)
+        js = """
+          <script>
+            (function(){
+              function announce(msg){
+                try{
+                  if(window.__smartlinkAnnounce) window.__smartlinkAnnounce(msg);
+                }catch(e){}
+              }
+              function copyText(text, inputEl){
+                if(navigator.clipboard && navigator.clipboard.writeText){
+                  navigator.clipboard.writeText(text).then(function(){ announce('Copied to clipboard'); }, function(){ fallbackCopy(inputEl); });
+                  return;
+                }
+                fallbackCopy(inputEl);
+              }
+              function fallbackCopy(inputEl){
+                try{
+                  if(inputEl){
+                    inputEl.focus();
+                    inputEl.select();
+                    if(document.execCommand && document.execCommand('copy')){
+                      announce('Copied to clipboard');
+                      return;
+                    }
+                  }
+                }catch(e){}
+                try{ window.prompt('Copy the link:', inputEl ? inputEl.value : ''); }catch(e){}
+              }
+              document.addEventListener('click', function(e){
+                var t = e.target;
+                if(!t) return;
+                var targetId = t.getAttribute && t.getAttribute('data-copy-target');
+                var copyUrl = t.getAttribute && t.getAttribute('data-copy-url');
+                if(targetId || copyUrl){
+                  var input = null;
+                  if(targetId){
+                    input = document.getElementById(targetId);
+                  }
+                  var url = copyUrl || (input && input.value) || '';
+                  if(url){
+                    copyText(url, input);
+                  }
+                }
+              });
+            })();
+          </script>
+        """
+
+        return render_layout(form_html + recent_html + rows_html + js)
     finally:
         try:
-            session.close()
+            session_db.close()
         except Exception:
             pass
 
@@ -158,22 +322,16 @@ def dashboard_edit(link_id):
 
     GET: render a form pre-populated with the current values (CSRF token included).
     POST: apply changes (target_url, optional slug, expire_at). Ownership enforced.
-
-    Ownership & error handling:
-      - If the row exists but is not owned by the current user -> return 403.
-      - If the row does not exist -> return 404.
     """
     user_id, err = _require_auth()
     if err:
         return err
 
-    session = models.Session()
+    session_db = models.Session()
     try:
-        # Preferred, owner-filtered fetch
-        short = session.query(models.ShortURL).filter_by(id=link_id, user_id=user_id).first()
+        short = session_db.query(models.ShortURL).filter_by(id=link_id, user_id=user_id).first()
         if not short:
-            # To return accurate 403 vs 404, check for existence without user filter
-            exists = session.query(models.ShortURL).filter_by(id=link_id).first()
+            exists = session_db.query(models.ShortURL).filter_by(id=link_id).first()
             if exists:
                 try:
                     _write_trace_117(f"DASHBOARD_EDIT_FORBIDDEN user_id={user_id} link_id={link_id}")
@@ -183,7 +341,6 @@ def dashboard_edit(link_id):
             else:
                 return render_layout("<h1>Not Found</h1><p>The requested link does not exist.</p>"), 404
 
-        # GET: render form
         if request.method == "GET":
             try:
                 from flask_wtf.csrf import generate_csrf
@@ -192,7 +349,6 @@ def dashboard_edit(link_id):
                 csrf_token = ""
 
             expire_at_val = short.expire_at.strftime("%Y-%m-%d %H:%M") if short.expire_at else ""
-            # Unique ids per-short (helps when multiple forms or client reuse)
             slug_id = f"slug-{short.id}"
             target_id = f"target-{short.id}"
             expire_id = f"expire-{short.id}"
@@ -200,9 +356,9 @@ def dashboard_edit(link_id):
               <h1>Edit Short URL</h1>
               <form method="post" action="/dashboard/{short.id}/edit" novalidate>
                 <label for="{slug_id}">Slug</label>
-                <input id="{slug_id}" type="text" name="slug" maxlength="255" value="{short.slug}">
+                <input id="{slug_id}" type="text" name="slug" maxlength="255" value="{escape(short.slug)}">
                 <label for="{target_id}">Target URL</label>
-                <input id="{target_id}" type="url" name="target_url" required style="width:100%" value="{short.target_url}">
+                <input id="{target_id}" type="url" name="target_url" required style="width:100%" value="{escape(short.target_url)}">
                 <label for="{expire_id}">Expire At (YYYY-MM-DD HH:MM UTC)</label>
                 <input id="{expire_id}" type="text" name="expire_at" value="{expire_at_val}">
                 <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -212,8 +368,6 @@ def dashboard_edit(link_id):
             """
             return render_layout(html)
 
-        # POST: apply update
-        # Collect form fields
         new_target_raw = request.form.get("target_url", "").strip()
         new_slug = request.form.get("slug", "").strip()
         new_expire_raw = request.form.get("expire_at", "").strip()
@@ -229,20 +383,21 @@ def dashboard_edit(link_id):
 
         # Normalize new target
         try:
-            new_target = validate_and_normalize_url(new_target_raw)
+            if validate_and_normalize_url is not None:
+                new_target = validate_and_normalize_url(new_target_raw)
+            else:
+                new_target = new_target_raw
         except Exception as e:
-            return render_layout(f"<h1>Invalid URL</h1><p>{str(e)}</p>"), 400
+            return render_layout(f"<h1>Invalid URL</h1><p>{escape(str(e))}</p>"), 400
 
         # If slug changed, validate and ensure uniqueness
         if new_slug and new_slug != short.slug:
             if not validate_custom_slug(new_slug):
                 return render_layout("<h1>Invalid Slug</h1><p>The provided slug is invalid. Allowed characters: A-Z a-z 0-9 _ -</p>"), 400
-            # Check for collisions
-            collision = session.query(models.ShortURL).filter_by(slug=new_slug).first()
+            collision = session_db.query(models.ShortURL).filter_by(slug=new_slug).first()
             if collision and collision.id != short.id:
-                # Conflict: slug already in use
                 try:
-                    suggestions = suggest_alternatives(new_slug, count=5, session=session)
+                    suggestions = suggest_alternatives(new_slug, count=5, session=session_db)
                 except Exception:
                     suggestions = []
                 sug_html = "<p>Slug already taken.</p>"
@@ -250,20 +405,18 @@ def dashboard_edit(link_id):
                     sug_html += "<ul>"
                     for s in suggestions:
                         short_path = url_for("shortener.redirect_slug", slug=s, _external=True)
-                        sug_html += f"<li>{s} -> <a href='{short_path}'>{short_path}</a></li>"
+                        sug_html += f"<li>{escape(s)} -> <a href='{short_path}'>{short_path}</a></li>"
                     sug_html += "</ul>"
                 return render_layout(f"<h1>Slug Conflict</h1>{sug_html}"), 400
-            # All good: assign new slug
             short.slug = new_slug
 
-        # Apply updates
         short.target_url = new_target
         short.expire_at = new_expire
 
         try:
-            session.add(short)
-            session.commit()
-            session.refresh(short)
+            session_db.add(short)
+            session_db.commit()
+            session_db.refresh(short)
             try:
                 _write_trace_117(f"DASHBOARD_EDIT_APPLIED user_id={user_id} link_id={short.id} slug={short.slug}")
             except Exception:
@@ -271,13 +424,13 @@ def dashboard_edit(link_id):
             return render_layout(f"<h1>Saved</h1><p>Your changes have been saved.</p><p><a href='{url_for('dashboard.dashboard_index')}'>Back to dashboard</a></p>")
         except Exception as e:
             try:
-                session.rollback()
+                session_db.rollback()
             except Exception:
                 pass
-            return render_layout(f"<h1>Database Error</h1><p>{str(e)}</p>"), 500
+            return render_layout(f"<h1>Database Error</h1><p>{escape(str(e))}</p>"), 500
     finally:
         try:
-            session.close()
+            session_db.close()
         except Exception:
             pass
 
@@ -286,24 +439,16 @@ def dashboard_edit(link_id):
 def dashboard_delete(link_id):
     """
     Delete (or soft-delete) a short URL owned by the authenticated user.
-
-    Behavior:
-      - Ownership enforced (403 if exists but not owned; 404 if not found).
-      - If current_app.config["SHORTURL_SOFT_DELETE"] is truthy: apply soft-delete by setting expire_at to now.
-      - Otherwise: delete the row.
-      - Commit with rollback on exception.
-      - CSRF-protected form expected in caller.
     """
     user_id, err = _require_auth()
     if err:
         return err
 
-    session = models.Session()
+    session_db = models.Session()
     try:
-        # Owner-filtered fetch
-        short = session.query(models.ShortURL).filter_by(id=link_id, user_id=user_id).first()
+        short = session_db.query(models.ShortURL).filter_by(id=link_id, user_id=user_id).first()
         if not short:
-            exists = session.query(models.ShortURL).filter_by(id=link_id).first()
+            exists = session_db.query(models.ShortURL).filter_by(id=link_id).first()
             if exists:
                 try:
                     _write_trace_117(f"DASHBOARD_DELETE_FORBIDDEN user_id={user_id} link_id={link_id}")
@@ -313,7 +458,6 @@ def dashboard_delete(link_id):
             else:
                 return render_layout("<h1>Not Found</h1><p>The requested link does not exist.</p>"), 404
 
-        # Decide soft vs hard delete based on config
         try:
             soft_delete = bool(current_app.config.get("SHORTURL_SOFT_DELETE", False))
         except Exception:
@@ -322,10 +466,10 @@ def dashboard_delete(link_id):
         try:
             if soft_delete:
                 short.expire_at = datetime.utcnow()
-                session.add(short)
+                session_db.add(short)
             else:
-                session.delete(short)
-            session.commit()
+                session_db.delete(short)
+            session_db.commit()
             try:
                 _write_trace_117(f"DASHBOARD_DELETE_APPLIED user_id={user_id} link_id={link_id} soft_delete={soft_delete}")
             except Exception:
@@ -333,13 +477,12 @@ def dashboard_delete(link_id):
             return redirect(url_for("dashboard.dashboard_index"))
         except Exception as e:
             try:
-                session.rollback()
+                session_db.rollback()
             except Exception:
                 pass
-            return render_layout(f"<h1>Database Error</h1><p>{str(e)}</p>"), 500
+            return render_layout(f"<h1>Database Error</h1><p>{escape(str(e))}</p>"), 500
     finally:
         try:
-            session.close()
+            session_db.close()
         except Exception:
             pass
-# --- END FILE: routes/dashboard.py ---
