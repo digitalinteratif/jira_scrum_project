@@ -128,13 +128,13 @@ class PythonTesterTool(BaseTool):
 python_tester_tool = PythonTesterTool()
 
 # --- 5. AGENT DEFINITIONS ---
-openai_llm = LLM(model="gpt-5.1-codex-mini", api_key=os.environ.get("OPENAI_API_KEY"))
+claude_llm = LLM(model="claude-sonnet-4-6", api_key=os.environ.get("CLAUDE_API_KEY"))
 
 scrum_master = Agent(
     role='Expert Scrum Master',
     goal='Oversee the implementation of the Jira ticket.',
     backstory="You ensure that only valid code blocks are returned matching the ticket requirements.",
-    llm=openai_llm,
+    llm=claude_llm,
     verbose=True
 )
 
@@ -142,7 +142,7 @@ architect = Agent(
     role='Systems Architect',
     goal='Design the implementation strategy based on the Jira ticket.',
     backstory="You design the path forward and tell the developer what files to create or modify.",
-    llm=openai_llm,
+    llm=claude_llm,
     verbose=True
 )
 
@@ -150,7 +150,7 @@ coder = Agent(
     role='Senior Developer',
     goal='Write clean code exactly as specified by the architect.',
     backstory="You always return your work in '--- FILE: path/to/file.ext ---' format. You write Python, Dockerfiles, and YAML.",
-    llm=openai_llm,
+    llm=claude_llm,
     verbose=True
 )
 
@@ -158,7 +158,7 @@ qa_auditor = Agent(
     role='Compliance Auditor',
     goal='Verify code passes local tests and generate finalized code blocks.',
     backstory="You ONLY return verified code blocks in '--- FILE: path ---' format. No narrative.",
-    llm=openai_llm,
+    llm=claude_llm,
     verbose=True,
     tools=[python_tester_tool]
 )
@@ -190,7 +190,7 @@ def run_build_cycle(issue, current_index, total_tickets):
         )
     ]
 
-    crew = Crew(agents=[scrum_master, architect, coder, qa_auditor], tasks=tasks, process=Process.hierarchical, manager_llm=openai_llm, verbose=True, output_log_file=trace_log_file)
+    crew = Crew(agents=[scrum_master, architect, coder, qa_auditor], tasks=tasks, process=Process.hierarchical, manager_llm=claude_llm, verbose=True, output_log_file=trace_log_file)
 
     logger.info(f"🔨 [{current_index}/{total_tickets}] Processing: {issue.key}...")
     result = crew.kickoff()
