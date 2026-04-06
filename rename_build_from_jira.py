@@ -128,7 +128,7 @@ class PythonTesterTool(BaseTool):
 python_tester_tool = PythonTesterTool()
 
 # --- 5. AGENT DEFINITIONS ---
-claude_llm = LLM(model="claude-sonnet-4-6", api_key=os.environ.get("CLAUDE_API_KEY"))
+claude_llm = LLM(model="anthropic/claude-opus-4-6", api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 scrum_master = Agent(
     role='Expert Scrum Master',
